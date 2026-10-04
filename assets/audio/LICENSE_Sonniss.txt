@@ -1,0 +1,29 @@
+Sonniss GDC Game Audio Bundles (2015-2026), https://sonniss.com/gameaudiogdc
+Licence: https://sonniss.com/gdc-bundle-license/
+
+  - Royalty-free, may be used in commercial and non-commercial projects (games, films, ...).
+  - The sounds may be edited / modified (everything in assets/audio/sonniss is processed:
+    cut, resampled to 44.1 kHz, filtered, level-matched, looped).
+  - No attribution required.
+  - The raw / unprocessed files must not be redistributed or resold as sound effects on their own.
+    Keep the raw downloads OUT of the project and out of any public repository
+    (they live in %LOCALAPPDATA%\UzaySiniri\audio_raw on the dev machine).
+  - Not for AI / machine-learning training.
+
+Everything under assets/audio/sonniss/ is derived from these bundles. Source packs used:
+  Bluezone / BluezoneCorp (snow footsteps, splash, tank explosions, detonation, building collapse,
+    cargo spaceship cockpit + alarm, alien spacecraft alarm, organic lifeform textures, futuristic UI,
+    retrofuturistic computer, high voltage, industrial lever switch), Levan Nadashvili soldier
+    footsteps, PMSFX steps dirt & gravel / dry grass, PMSFX sci-fi passby + foundation sci-fi vol 2,
+    Studio 23 footsteps, Tovusound Edward footsteps, Wav Junction footsteps, Soundrangers wind /
+    thunder / hydrology underwater, InMotionAudio cave design / submerge, Justsoundeffects forest
+    ambiences + crickets and cicadas, InspectorJ rain, Soundopolis underwater, Matt Script debris,
+    Mechanical Wave rock brick and dirt, Tatak rocks and debris, Sound Spark electric arcs,
+    Wakerone electric deluxe, DavidDumais ATV Arctic Cat 650 H1 + explosion pack, David Dumais
+    alarms pack 1, Digital Rain Lab driving forces, Pole Position RC jet /
+    Warfare 2 / AKM / L85 / HK416 / M1919A4 / gun foley, Fox Audio space racer 2, Airborne Sound
+    variety 1, SoundMorph portals, The Sound Pack Tree (doors, construction tools), Gamemaster Audio
+    bullet impacts + explosion pack, Lukas Tvrdon distant blast, TS Sound 12 gauge shotgun,
+    Timothy McHugh Gorification, 344 Audio dinosaurs 2, Articulated Sounds camel growls, Ivo Vicic
+    deer, RDGSFX creatures, Sonic Bat birds, Soundmind predatory
+    birds, Varazuvi underwater whale, 3maze electric motors, Double Trouble Audio cement factory.
