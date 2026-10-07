@@ -28,6 +28,13 @@ uniform float core_glow = 0.35;          // emission of the deepest rock (kept l
 uniform sampler2DArray detail_tex : filter_linear_mipmap_anisotropic, repeat_enable;
 uniform float detail_on = 0.0;
 uniform float detail_flat_layer = 0.0;   // layer for open ground: 0 regolith, 3 snow (ice moon)
+// Zengin damarlar (scripts/planet/veins.gd; scripts/planet/vein_fx.gd fills these per planet): capsules
+// in body-local metres (a meteor core is a capsule with A == B). Where a dug wall cuts one it turns to
+// glowing crystal facets; the glow fades as the vein is dug out (vein_col.a).
+uniform int vein_count = 0;
+uniform vec4 vein_a[40];           // xyz end A, w radius
+uniform vec4 vein_b[40];           // xyz end B, w unused
+uniform vec4 vein_col[40];         // rgb crystal colour (linear), a glow 0..1
 const float DETAIL_TILE = 2.0;     // TerrainTextures.TILE_M
 const float DETAIL_GRAD = 2.5;     // TerrainTextures.GRAD_RANGE
 
@@ -53,6 +60,14 @@ float vnoise(vec3 p) {
 			mix(hash13(i + vec3(0, 1, 0)), hash13(i + vec3(1, 1, 0)), f.x), f.y),
 		mix(mix(hash13(i + vec3(0, 0, 1)), hash13(i + vec3(1, 0, 1)), f.x),
 			mix(hash13(i + vec3(0, 1, 1)), hash13(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+
+// Distance from p to the segment a-b.
+float vein_seg_dist(vec3 p, vec3 a, vec3 b) {
+	vec3 ab = b - a;
+	float l2 = dot(ab, ab);
+	float t = l2 > 1e-6 ? clamp(dot(p - a, ab) / l2, 0.0, 1.0) : 0.0;
+	return length(p - (a + ab * t));
 }
 
 // Triplanar sample of one detail layer (same as terrain.gdshader).
@@ -117,6 +132,13 @@ void fragment() {
 	st = mix(st, strata_deep, smoothstep(14.0, 16.0, dd));
 	float seam = max(1.0 - smoothstep(0.0, 0.2, abs(dd - 3.0)), 1.0 - smoothstep(0.0, 0.25, abs(dd - 15.0)));
 	st *= (1.0 - seam * 0.35) * (0.92 + 0.08 * sin(dd * 2.4 + n * 2.0));
+	// Thin layers every ~1.3 m (wavy; each a little lighter or darker, a dark parting line on top)
+	// and a fine grain, so even a shallow pit reads as cut soil and rock, not a flat colour.
+	float bpos = dd / 1.3 + (vnoise(body_pos * 0.45) - 0.5) * 0.5;
+	float bf = fract(bpos);
+	st *= 0.86 + 0.26 * hash13(vec3(floor(bpos), 3.7, 1.3));
+	st *= 1.0 - 0.2 * (1.0 - smoothstep(0.0, 0.07, bf));
+	st *= 0.86 + 0.28 * vnoise(body_pos * 1.9) * (0.6 + 0.4 * fine);
 	// Toward the core: warm, faintly glowing rock (from ~45 % of the radius down).
 	float core_k = smoothstep(planet_radius * 0.45, planet_radius * 0.85, dd);
 	st = mix(st, core_color * (0.8 + 0.3 * n), core_k);
@@ -136,13 +158,25 @@ void fragment() {
 		vec3 nw = normalize(world_normal);
 		vec3 bw = pow(abs(nw), vec3(4.0));
 		bw /= bw.x + bw.y + bw.z;
-		float wr = mix(rock_w, smoothstep(7.0, 10.0, depth), under);
+		// Dug ground: soil (layer 0) on the floor and gentle walls, fractured rock (1) on steep walls
+		// and deep down; never the open-ground layer (snow / sand would read as an untouched sheet).
+		float wr = mix(rock_w, max(smoothstep(6.0, 10.0, depth), (1.0 - smoothstep(0.3, 0.6, slope)) * 0.75), under);
 		float wg = 1.0 - wr;
+		float w_soil = wg * under;
+		float w_flat = wg - w_soil;
+		if (detail_flat_layer < 0.5) {
+			w_flat += w_soil;
+			w_soil = 0.0;
+		}
 		vec2 la = vec2(0.0);
 		float wt = 0.0;
-		if (wg > 0.02) {
-			detail_tri(body_pos, bw, detail_flat_layer, wg, dpx, dpy, la, g_det);
-			wt += wg;
+		if (w_flat > 0.02) {
+			detail_tri(body_pos, bw, detail_flat_layer, w_flat, dpx, dpy, la, g_det);
+			wt += w_flat;
+		}
+		if (w_soil > 0.02) {
+			detail_tri(body_pos, bw, 0.0, w_soil, dpx, dpy, la, g_det);
+			wt += w_soil;
 		}
 		if (wr > 0.02) {
 			detail_tri(body_pos, bw, 1.0, wr, dpx, dpy, la, g_det);
@@ -150,9 +184,51 @@ void fragment() {
 		}
 		wt = max(wt, 1e-4);
 		la /= wt;
-		float vary = 0.55 + 0.45 * smoothstep(0.2, 0.8, n);
+		float vary = mix(0.55 + 0.45 * smoothstep(0.2, 0.8, n), 1.0, under);
 		col *= mix(1.0, (0.65 + 0.7 * la.x) * mix(1.0, la.y, 0.8), 0.75 * dk * vary);
 		g_det *= dk_bump * vary * (1.0 - pool_k) / wt;
+	}
+
+	// Rich veins: only on dug / underground walls near the camera. The nearest capsule decides; inside
+	// it 0.45 m crystal facets (own tilt and brightness each), a soft pulsing glow and rare sparkles;
+	// a faint halo just outside. A spent vein (glow 0) stays as dull quartz.
+	vec3 vein_emit = vec3(0.0);
+	float vein_k = 0.0;
+	vec3 vein_n = vec3(0.0);
+	if (vein_count > 0 && under > 0.02 && cam_d < 90.0) {
+		float vbest = 1.0e5;
+		vec4 vc = vec4(0.0);
+		for (int i = 0; i < 40; i++) {
+			if (i >= vein_count) {
+				break;
+			}
+			float sd = vein_seg_dist(rel, vein_a[i].xyz, vein_b[i].xyz) - vein_a[i].w;
+			if (sd < vbest) {
+				vbest = sd;
+				vc = vein_col[i];
+			}
+		}
+		float vedge = 0.1 + 0.16 * vnoise(rel * 1.7);
+		float inside = 1.0 - smoothstep(-vedge, vedge, vbest);
+		float halo = (1.0 - smoothstep(0.0, 0.9, vbest)) * (1.0 - inside);
+		if (inside + halo > 0.001) {
+			float vg = clamp(vc.a, 0.0, 1.0);
+			vec3 cell = floor(rel * 2.2);
+			float h1 = hash13(cell);
+			float h2 = hash13(cell + vec3(17.1, 3.3, 9.7));
+			float h3 = hash13(cell + vec3(5.9, 41.2, 23.4));
+			vec3 crys = vc.rgb * (0.5 + 0.6 * h2);
+			crys = mix(crys, vec3(0.3, 0.32, 0.34) + vc.rgb * 0.08, (1.0 - vg) * 0.75);
+			col = mix(col, crys, inside * 0.9);
+			col = mix(col, col * (vec3(1.0) + vc.rgb * 0.35), halo * vg);
+			vein_k = inside;
+			vein_n = normalize(vec3(h1, h2, h3) * 2.0 - 1.0);
+			float tw = hash13(cell + vec3(floor(TIME * 2.5 + h1 * 7.0)));
+			float spark = smoothstep(0.93, 1.0, tw) * (0.5 + 0.5 * sin(TIME * 9.0 + h3 * 30.0));
+			float pulse = 0.75 + 0.25 * sin(TIME * 1.6 + dot(rel, vec3(0.7, 0.5, 0.3)));
+			vein_emit = vc.rgb * vg * (inside * (0.3 + 0.4 * h1) * pulse + halo * 0.15)
+					+ vec3(1.0, 0.95, 0.85) * spark * inside * vg * 1.1;
+		}
 	}
 
 	ALBEDO = col;
@@ -161,10 +237,29 @@ void fragment() {
 		vec3 g = g_det - nW * dot(g_det, nW);
 		NORMAL = normalize((VIEW_MATRIX * vec4(normalize(nW - g), 0.0)).xyz);
 	}
+	// Far away (the other planet across the gap) the 2 m cells' facets shade as dark blotches:
+	// lean the normal a little toward the body's up there (the relief still reads).
+	float far_k = smoothstep(120.0, 320.0, cam_d) * 0.35;
+	if (far_k > 0.001) {
+		NORMAL = normalize(mix(NORMAL, (VIEW_MATRIX * vec4(up, 0.0)).xyz, far_k));
+	}
 	ROUGHNESS = 0.92 - pool * pool_gloss * 0.75;
 	SPECULAR = 0.25 + pool * pool_gloss * 0.4;
 	EMISSION = emit + core_color * core_glow * core_k * under * (0.7 + 0.3 * fine);
-	// Tunnel walls: only a mild ambient-occlusion dip (the lighting rule: no crushed blacks).
-	AO = mix(1.0, 0.72, smoothstep(2.5, 12.0, depth) * under);
+	// Pits and tunnels sit in the shadow of their own walls with only the dim blue ambient: a little
+	// light bounced off the sunlit ground keeps the cut soil readable (the lighting rule: no
+	// crushed blacks), fading with depth.
+	EMISSION += col * under * 0.09 * (1.0 - 0.5 * smoothstep(3.0, 14.0, depth));
+	// Rich veins (above): glossy crystal facets and their glow.
+	if (vein_k > 0.001) {
+		vec3 vnW = normalize((INV_VIEW_MATRIX * vec4(NORMAL, 0.0)).xyz);
+		vec3 vfn = normalize(vnW + vein_n * 0.65);
+		NORMAL = normalize((VIEW_MATRIX * vec4(normalize(mix(vnW, vfn, vein_k)), 0.0)).xyz);
+		ROUGHNESS = mix(ROUGHNESS, 0.22, vein_k * 0.85);
+		SPECULAR = mix(SPECULAR, 0.6, vein_k);
+	}
+	EMISSION += vein_emit;
+	// Tunnel walls: only a mild ambient-occlusion dip.
+	AO = mix(1.0, 0.8, smoothstep(3.0, 14.0, depth) * under);
 	AO_LIGHT_AFFECT = 0.0;
 }

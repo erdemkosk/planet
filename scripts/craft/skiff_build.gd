@@ -95,11 +95,16 @@ const P_VENT := -6.0
 const P_TILES := -7.0
 const P_BRUSHED := -8.0
 
-## Liveries: home = white with an orange pinstripe, white strobe; rival = dark gunmetal with red
-## stripes and a red strobe (light lettering, add_decals).
+## Liveries: [paint, stripe colour, strobe colour, stripe pattern]. home = white with an orange
+## pinstripe, white strobe; rival = dark gunmetal with red stripes and a red strobe (light lettering,
+## add_decals); armed (the Silahlı Mekik, armed_skiff.gd) = dark olive armour, yellow / black hazard
+## stripes, white strobe.
 const LIVERY := {
-	"home": [Color(0.80, 0.80, 0.78, 0.42), Color(0.86, 0.42, 0.12, 0.45), Color(1.0, 1.0, 1.0, 1.0)],
-	"rival": [Color(0.31, 0.30, 0.30, 0.46), Color(0.76, 0.15, 0.1, 0.45), Color(1.0, 0.22, 0.16, 1.0)],
+	"home": [Color(0.80, 0.80, 0.78, 0.42), Color(0.86, 0.42, 0.12, 0.45), Color(1.0, 1.0, 1.0, 1.0), 0.0],
+	"rival": [Color(0.31, 0.30, 0.30, 0.46), Color(0.76, 0.15, 0.1, 0.45), Color(1.0, 0.22, 0.16, 1.0), 0.0],
+	"armed": [Color(0.34, 0.36, 0.32, 0.55), Color(0.9, 0.72, 0.2, 0.5), Color(1.0, 1.0, 1.0, 1.0), -1.0],
+	# The rival's Silahlı Mekik (AI pilot): the rival gunmetal with red / black hazard stripes.
+	"rival_armed": [Color(0.29, 0.28, 0.28, 0.5), Color(0.8, 0.16, 0.1, 0.5), Color(1.0, 0.22, 0.16, 1.0), -1.0],
 }
 
 static var _sets := {}           # livery -> {hull, leds} + the shared meshes
@@ -107,13 +112,15 @@ static var _shared := {}
 # The livery being built (the exterior builders read these).
 static var _paint := C_WHITE
 static var _stripe := C_ORANGE
+static var _stripe_pat := 0.0
+static var _tip_mesh: ArrayMesh
 static var _strobe_col := Color(1.0, 1.0, 1.0, 1.0)
 
 
-## Every mesh of a team's livery, built on first use: hull, leds (per livery); cabin, glass, foot,
-## stick, throttle (shared).
+## Every mesh of a livery, built on first use: hull, leds (per livery; "armed" also weapons,
+## barrels, flash); cabin, glass, foot, stick, throttle (shared).
 static func meshes(team := "home") -> Dictionary:
-	var key := "rival" if team == "rival" else "home"
+	var key := team if LIVERY.has(team) else "home"
 	if _sets.has(key):
 		return _sets[key]
 	if _shared.is_empty():
@@ -126,7 +133,12 @@ static func meshes(team := "home") -> Dictionary:
 	_paint = lv[0]
 	_stripe = lv[1]
 	_strobe_col = lv[2]
+	_stripe_pat = float(lv[3])
 	var d := {"hull": _build_hull(), "leds": _build_leds()}
+	if key == "armed" or key == "rival_armed":
+		d["weapons"] = _build_weapons()
+		d["barrels"] = _build_barrels()
+		d["flash"] = _build_flash()
 	d.merge(_shared)
 	_sets[key] = d
 	return d
@@ -513,8 +525,8 @@ static func _build_hull() -> ArrayMesh:
 	_band(st, Z_NOSE, Z_TAIL, B - 0.62, B + 0.62, C_GRAPHITE, P_TILES, 0.0)
 	_band(st, Z_NOSE, Z_TAIL, PI + 0.2, B - 0.62, _paint, 0.52, 0.0)
 	_band(st, Z_NOSE, Z_TAIL, B + 0.62, TAU - 0.2, _paint, 0.52, 0.0)
-	_band(st, Z_NOSE, Z_TAIL, PI + 0.1, PI + 0.2, _stripe, 0.0, 0.0)
-	_band(st, Z_NOSE, Z_TAIL, TAU - 0.2, TAU - 0.1, _stripe, 0.0, 0.0)
+	_band(st, Z_NOSE, Z_TAIL, PI + 0.1, PI + 0.2, _stripe, _stripe_pat, 0.0)
+	_band(st, Z_NOSE, Z_TAIL, TAU - 0.2, TAU - 0.1, _stripe, _stripe_pat, 0.0)
 	_band(st, Z_NOSE, Z_TAIL, PI, PI + 0.1, _paint, 0.52, 0.0)
 	_band(st, Z_NOSE, Z_TAIL, TAU - 0.1, TAU, _paint, 0.52, 0.0)
 	# Upper half of the nose: matte anti-glare panel ahead of the windscreen, white flanks.
@@ -560,7 +572,7 @@ static func _nacelles(st: SurfaceTool) -> void:
 		# Rounded nose, an orange band, the long white body, a graphite tail cone.
 		_lathe(st, xf, [Vector2(0.0, -1.52), Vector2(0.07, -1.505), Vector2(0.13, -1.46), Vector2(0.175, -1.38),
 				Vector2(0.2, -1.27), Vector2(0.21, -1.17)], _paint, P_PLAIN, 0.0, 18)
-		_lathe(st, xf, [Vector2(0.21, -1.17), Vector2(0.21, -1.02)], _stripe, P_PLAIN, 0.0, 18)
+		_lathe(st, xf, [Vector2(0.21, -1.17), Vector2(0.21, -1.02)], _stripe, _stripe_pat, 0.0, 18)
 		_lathe(st, xf, [Vector2(0.21, -1.02), Vector2(0.21, -0.2), Vector2(0.21, 0.6), Vector2(0.21, 1.25)],
 				_paint, 0.45, 0.0, 18)
 		_lathe(st, xf, [Vector2(0.21, 1.25), Vector2(0.205, 1.42), Vector2(0.185, 1.56), Vector2(0.15, 1.66),
@@ -868,15 +880,110 @@ static func _build_leds() -> ArrayMesh:
 
 
 # ==================================================================================================
+# Weapons (the Silahlı Mekik, armed_skiff.gd): chin guns, rocket pods
+# ==================================================================================================
+
+## Twin rotary cannon under the nose: housings at (±GUN_X, GUN_Y); each barrel cluster spins about
+## the ship's Z at GUN_PIVOT_Z, its muzzle at GUN_MUZZLE_Z.
+const GUN_X := 0.3
+const GUN_Y := 0.45
+const GUN_PIVOT_Z := -2.15
+const GUN_MUZZLE_Z := -2.6
+## Rocket pods outboard of the nacelles: centre (±POD_X, POD_Y), tube mouths at POD_Z0, two tubes
+## each (POD_TUBES: x / y offsets), four rockets in all.
+const POD_X := 1.34
+const POD_Y := 0.62
+const POD_Z0 := -0.96
+const POD_R := 0.135
+const POD_TUBES := [Vector2(0.0, 0.056), Vector2(0.0, -0.056)]
+
+
+## Gun housings, rocket pods with their pylons (hull material, the livery's colours).
+static func _build_weapons() -> ArrayMesh:
+	var st := _new_st()
+	var rot := Basis(Vector3.RIGHT, PI * 0.5)        # lathe Y -> ship Z
+	for sx: float in [-1.0, 1.0]:
+		var gx := sx * GUN_X
+		# Gun housing tucked under the nose, a fairing into the belly, an ammo feed box behind it.
+		_rbox(st, _xf(Vector3(gx, GUN_Y, -1.93)), Vector3(0.072, 0.066, 0.23), C_GRAPHITE, 0.2, 0.15)
+		_rbox(st, _xf(Vector3(gx, GUN_Y + 0.07, -1.86)), Vector3(0.045, 0.04, 0.13), _paint, P_PLAIN, 0.0)
+		_rbox(st, _xf(Vector3(gx * 0.82, GUN_Y + 0.01, -1.66)), Vector3(0.05, 0.05, 0.07), C_STEEL, P_VENT, 0.2)
+		_cyl(st, Vector3(gx, GUN_Y, -2.13), Vector3(gx, GUN_Y, GUN_PIVOT_Z - 0.04), 0.058, 0.052, C_STEEL, P_PLAIN, 0.3, 16)
+		# Rocket pod: pylon from the nacelle, a rounded tube body, hazard band, the tube mouths.
+		var px := sx * POD_X
+		_rbox(st, _xf(Vector3(sx * 1.2, POD_Y, -0.32)), Vector3(0.075, 0.035, 0.3), C_GRAPHITE, 0.25, 0.1)
+		var pxf := Transform3D(rot, Vector3(px, POD_Y, 0.0))
+		_lathe(st, pxf, [Vector2(POD_R - 0.01, POD_Z0), Vector2(POD_R, POD_Z0 + 0.03), Vector2(POD_R, -0.86)], C_GRAPHITE, P_PLAIN, 0.15, 20)
+		_lathe(st, pxf, [Vector2(POD_R, -0.86), Vector2(POD_R, -0.74)], _stripe, _stripe_pat, 0.0, 20)
+		_lathe(st, pxf, [Vector2(POD_R, -0.74), Vector2(POD_R, -0.2), Vector2(POD_R, 0.12)], _paint, 0.3, 0.0, 20)
+		_lathe(st, pxf, [Vector2(POD_R, 0.12), Vector2(0.115, 0.24), Vector2(0.07, 0.31), Vector2(0.0, 0.33)], C_GRAPHITE, P_PLAIN, 0.15, 20)
+		_disc(st, Vector3(px, POD_Y, POD_Z0), Vector3.FORWARD, POD_R - 0.01, C_STEEL, P_PLAIN)
+		for t: Vector2 in POD_TUBES:
+			var c := Vector3(px + t.x, POD_Y + t.y, POD_Z0 - 0.002)
+			_disc(st, c, Vector3.FORWARD, 0.04, Color(0.12, 0.12, 0.13, 0.9), P_PLAIN)
+			_lathe(st, Transform3D(rot, c), [Vector2(0.04, -0.012), Vector2(0.05, -0.006), Vector2(0.05, 0.0)], C_METAL, P_PLAIN, 0.3, 14)
+	return _commit(st)
+
+
+## One barrel cluster (three barrels round the spin axis), along -Z from its pivot.
+static func _build_barrels() -> ArrayMesh:
+	var st := _new_st()
+	var bl := GUN_PIVOT_Z - GUN_MUZZLE_Z
+	for k in 3:
+		var a := TAU * float(k) / 3.0
+		var o := Vector3(cos(a), sin(a), 0.0) * 0.027
+		_cyl(st, o, o + Vector3(0.0, 0.0, -bl), 0.011, 0.01, C_STEEL, P_BRUSHED, 0.3, 8)
+	_cyl(st, Vector3(0, 0, -bl * 0.62), Vector3(0, 0, -bl * 0.62 - 0.025), 0.045, 0.045, C_GRAPHITE, P_PLAIN, 0.2, 14)
+	_cyl(st, Vector3(0, 0, -bl + 0.02), Vector3(0, 0, -bl), 0.043, 0.043, C_GRAPHITE, P_PLAIN, 0.2, 14)
+	_cyl(st, Vector3(0, 0, 0.0), Vector3(0, 0, -0.03), 0.05, 0.05, C_STEEL, P_PLAIN, 0.3, 14)
+	return _commit(st)
+
+
+## Muzzle flash: crossed soft quads along -Z and one facing forward (UV 0..1; additive material).
+static func _build_flash() -> ArrayMesh:
+	var st := _new_st()
+	var L := 0.42
+	var W := 0.1
+	for ax: Vector3 in [Vector3.RIGHT, Vector3.UP]:
+		var n := ax.cross(Vector3.FORWARD)
+		var a := [ax * -W, n, Vector2(0, 0)]
+		var b := [ax * W, n, Vector2(1, 0)]
+		var c := [ax * W + Vector3(0, 0, -L), n, Vector2(1, 1)]
+		var d := [ax * -W + Vector3(0, 0, -L), n, Vector2(0, 1)]
+		_quad(st, a, b, c, d, Color(1, 1, 1, 1), 0.0, 0.0)
+	var f := 0.13
+	_quad(st, [Vector3(-f, -f, -0.02), Vector3.FORWARD, Vector2(0, 0)], [Vector3(f, -f, -0.02), Vector3.FORWARD, Vector2(1, 0)],
+			[Vector3(f, f, -0.02), Vector3.FORWARD, Vector2(1, 1)], [Vector3(-f, f, -0.02), Vector3.FORWARD, Vector2(0, 1)],
+			Color(1, 1, 1, 1), 0.0, 0.0)
+	return _commit(st)
+
+
+## A loaded rocket's nose in a tube mouth (one per tube, hidden once fired).
+static func rocket_tip_mesh() -> ArrayMesh:
+	if _tip_mesh != null:
+		return _tip_mesh
+	var st := _new_st()
+	_lathe(st, Transform3D(Basis(Vector3.RIGHT, PI * 0.5), Vector3.ZERO), [Vector2(0.032, 0.0), Vector2(0.026, -0.03),
+			Vector2(0.012, -0.055), Vector2(0.0, -0.065)], C_ORANGE, P_PLAIN, 0.0, 12, true)
+	var m := _commit(st)
+	_tip_mesh = m
+	return m
+
+
+# ==================================================================================================
 # Decals
 # ==================================================================================================
 
 ## Painted lettering. Home: MEKİK on the tail flanks, the registration (YR-0N) on the nacelles,
 ## dark paint. Rival: the registration (RK-0N) on the tail, RAKİP on the nacelles, light paint.
+## Armed: the registration (SM-0N) on the tail, SİLAHLI on the nacelles (behind the rocket pods),
+## light paint.
 static func add_decals(parent: Node3D, team := "home", reg := "YR-01") -> void:
 	var f := UI.font(700)
-	var rival := team == "rival"
-	var ink := Color(0.76, 0.74, 0.72, 0.9) if rival else Color(0.2, 0.21, 0.23, 0.9)
+	var rival := team.begins_with("rival")         # (+ "rival_armed": the rival's Silahlı Mekik)
+	var armed := team.ends_with("armed")
+	var light := rival or armed
+	var ink := Color(0.76, 0.74, 0.72, 0.9) if light else Color(0.2, 0.21, 0.23, 0.9)
 	var warn := Color(0.86, 0.3, 0.22, 0.9) if rival else Color(0.72, 0.42, 0.1, 0.9)
 	for sx: float in [-1.0, 1.0]:
 		var z := 0.95
@@ -884,11 +991,12 @@ static func add_decals(parent: Node3D, team := "home", reg := "YR-01") -> void:
 		var th := 0.12 if sx > 0.0 else PI - 0.12
 		var p := sp(s, th, z, -0.004)
 		var taper := atan2(section(1.25).y - section(0.65).y, 0.6)
-		var l := _label(f, reg if rival else "MEKİK", 54, ink)
+		var l := _label(f, reg if light else "MEKİK", 54, ink)
 		l.transform = Transform3D(Basis(Vector3.UP, sx * (PI * 0.5 + taper)), p)
 		parent.add_child(l)
-		var l2 := _label(f, "RAKİP" if rival else reg, 30, Color(ink, 0.85))
-		l2.transform = Transform3D(Basis(Vector3.UP, sx * PI * 0.5), Vector3(sx * (NAC_X + NAC_R + 0.003), NAC_Y + 0.02, 0.35))
+		var l2 := _label(f, "RAKİP" if rival else ("SİLAHLI" if armed else reg), 30, Color(ink, 0.85))
+		l2.transform = Transform3D(Basis(Vector3.UP, sx * PI * 0.5), Vector3(sx * (NAC_X + NAC_R + 0.003), NAC_Y + 0.02,
+				0.75 if armed else 0.35))
 		parent.add_child(l2)
 		var l3 := _label(f, "İTİCİ — UZAK DUR", 18, warn)
 		l3.transform = Transform3D(Basis(Vector3.UP, sx * PI * 0.5), Vector3(sx * (NAC_X + NAC_R + 0.003), NAC_Y, 1.05))

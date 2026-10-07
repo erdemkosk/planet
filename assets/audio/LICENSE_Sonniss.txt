@@ -27,3 +27,8 @@ Everything under assets/audio/sonniss/ is derived from these bundles. Source pac
     Timothy McHugh Gorification, 344 Audio dinosaurs 2, Articulated Sounds camel growls, Ivo Vicic
     deer, RDGSFX creatures, Sonic Bat birds, Soundmind predatory
     birds, Varazuvi underwater whale, 3maze electric motors, Double Trouble Audio cement factory.
+
+Also derived from these bundles: assets/audio/helmet/suit_fan.wav (BluezoneCorp cargo spaceship
+cockpit ambience, band-limited, mixed with a synthesized airflow hiss, looped) and
+assets/audio/helmet/suit_servo_NN.wav (3maze electric motors, pitched, filtered, faded). The breath
+files in that folder are from Pixabay: see LICENSE_Pixabay.txt.

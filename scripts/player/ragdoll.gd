@@ -12,7 +12,26 @@ signal finished(pelvis_pos: Vector3, forward: Vector3)
 const MASK := 1 | 2 | 4        # terrain | ship | vehicles (Game.LAYER_*)
 const LOW_G := 0.3            # m/s² — below this the ragdoll recovers floating, no get-up
 const ZERO_G_TUMBLE := 0.85
+const LIMB_REL_MAX := 15.0    # m/s: a limb's speed relative to the pelvis (keeps the joints together;
+							  # 15 leaves room for hit_reactor's torso kick at the hit point)
 const DEG := PI / 180.0
+const TORSO_SPIN_K := 1.4     # rad/s per (m/s × m of lever): kick_torso's topple / twist spin
+const TORSO_SPIN_MAX := 4.0   # rad/s cap of that spin (2026-10-06 tok: 5 -> 4)
+const ANG_MAX := 22.0         # rad/s: any part spinning faster is clamped (a solver blow-up never launches it)
+const SPEED_MAX := 30.0       # m/s: pelvis speed cap unless `escape` (a corpse flung into space on purpose)
+## 2026-10-06 tok: heavier bodies (they fall and slump instead of flying and bouncing): linear damping
+## (was 0.05), torso / limb angular damping (was 0.9 / 0.4), bounce (was 0.12), friction (was 0.8), and
+## the random start spin per m/s of launch (was 0.25, at most 6 rad/s).
+const LIN_DAMP := 0.35
+const ANG_DAMP_TORSO := 1.3
+const ANG_DAMP_LIMB := 0.6
+const BOUNCE := 0.05
+const FRICTION := 1.0
+const SPIN_PER_MS := 0.18
+const SPIN_MAX := 4.0
+## I / m (m²) of each part about a cross axis (from its shapes), for kick_part's spin.
+const PART_K2 := {"pelvis": 0.018, "chest": 0.035, "head": 0.012, "uarm0": 0.012, "uarm1": 0.012,
+		"farm0": 0.016, "farm1": 0.016, "thigh0": 0.02, "thigh1": 0.02, "shin0": 0.02, "shin1": 0.02}
 
 var player
 var astronaut
@@ -35,7 +54,22 @@ var _getup_t := -1.0
 var zero_g_end := false        # finished by the weightless quick-recovery path
 var no_float_recover := false  # e.g. while dead: stay limp
 var _getup_len := 1.4
+var _speed_cap := SPEED_MAX     # start(): max(SPEED_MAX, the launch speed × 1.3)
 var _blend_to: Camera3D
+## Render interpolation (perf pass 2026-10-07): the bodies move at the 60 Hz physics rate, the screen
+## runs faster (144 Hz here), so the model / follow camera are drawn between the part transforms of the
+## last two physics ticks (Engine.get_physics_interpolation_fraction) instead of stepping 2-3 frames
+## per tick ("ölünce kare kare"). name -> Transform3D seen at the previous / last tick.
+var _rx_prev := {}
+var _rx_cur := {}
+## A dead body (no_float_recover) that has settled is put to sleep (Jolt: no solver / CCD cost, no
+## script loop, no bone drive while asleep); anything that sets a velocity wakes it again.
+const DEAD_REST_MIN := 1.5      # s after the launch...
+const DEAD_REST_SETTLE := 1.0   # ...and this long settled (the _settle clock)
+var _resting := false
+var _rest_posed := false
+var _rest_posed_for = null
+var _cam_t := 0.0
 
 
 ## Part definitions: name, bone getter, mass, shapes [[type, size, offset]] in bone space.
@@ -84,6 +118,9 @@ func start(p, vel: Vector3, min_time: float, exclude: Array = [], follow_cam := 
 	# Stay down longer after harder hits (2.5-4 s), like a real person catching their breath.
 	_min_t = maxf(min_time, clampf(2.5 + vel.length() / 12.0, 2.5, 4.0))
 	_max_t = _min_t + 4.0
+	# A deliberate launch (e.g. the pusher's into-space fling) keeps its speed; anything faster than
+	# that (or than SPEED_MAX) can only come from a physics blow-up and is clamped.
+	_speed_cap = maxf(SPEED_MAX, vel.length() * 1.3)
 	top_level = true
 	# Current (animated) bone transforms.
 	var parts := _parts()
@@ -105,12 +142,13 @@ func start(p, vel: Vector3, min_time: float, exclude: Array = [], follow_cam := 
 		b.collision_layer = 0
 		b.collision_mask = MASK
 		b.continuous_cd = true
-		b.linear_damp = 0.05
-		b.angular_damp = 1.2
+		b.linear_damp = LIN_DAMP
+		# Limbs and head swing loosely (they flop and trail); the torso turns heavier.
+		b.angular_damp = ANG_DAMP_TORSO if d[0] in ["pelvis", "chest"] else ANG_DAMP_LIMB
 		b.can_sleep = false
 		var pm := PhysicsMaterial.new()
-		pm.friction = 0.8
-		pm.bounce = 0.12
+		pm.friction = FRICTION
+		pm.bounce = BOUNCE
 		b.physics_material_override = pm
 		for s in d[3]:
 			var cs := CollisionShape3D.new()
@@ -141,14 +179,20 @@ func start(p, vel: Vector3, min_time: float, exclude: Array = [], follow_cam := 
 		_joint(bodies[j[0]], bodies[j[1]], j[2])
 	_fixed = [astronaut.spine] + astronaut.hand + astronaut.foot
 	# Jump to the animated pose and launch.
-	var spin := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * clampf(vel.length() * 0.25, 1.0, 6.0)
+	var spin := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * clampf(vel.length() * SPIN_PER_MS, 1.0, SPIN_MAX)
 	var center: Vector3 = anim["pelvis"].origin
 	for n in bodies:
 		var b: RigidBody3D = bodies[n]
 		b.global_transform = anim[n]
 		b.linear_velocity = vel + spin.cross(b.global_position - center) * 0.5
 		b.angular_velocity = spin * 0.5
+		# A corpse goes limp at once: its limbs and head get a little loose spin of their own, so it
+		# crumples instead of keeping the last animated pose like a statue.
+		if no_float_recover and not (n in ["pelvis", "chest"]):
+			b.angular_velocity += Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * 2.5
 		_prev_v[n] = b.linear_velocity
+		_rx_prev[n] = anim[n]
+		_rx_cur[n] = anim[n]
 
 	# Follow camera (the player's; an AI body passes follow_cam = false).
 	if not follow_cam:
@@ -167,6 +211,50 @@ func start(p, vel: Vector3, min_time: float, exclude: Array = [], follow_cam := 
 	cam.global_position = _cam_pos
 	cam.current = true
 	_shake = clampf(vel.length() / 20.0, 0.2, 1.0)
+
+
+## Hit-located launch (hit_reactor.gd, net puppets): dv × the whole body's mass goes into the torso
+## (chest + pelvis, split by mass so both gain the same speed) through their centres, plus a BOUNDED
+## spin about (lever × dv) from where it was hit, so the body topples / twists by the hit location and
+## the limbs (started with only the uniform share of the launch) trail and flop. (Applying the whole
+## momentum off-centre spun the light torso at ~200 rad/s and blew the joints up: corpses shot off into
+## space.) point INF: no spin. Call right after start().
+## The momentum goes in as a velocity change, not apply_central_impulse(): in the frame start() made the
+## bodies the physics server has not taken their mass in yet and an impulse acts on a 1 kg body (2026-10-07
+## probe: a 2.6 m/s kick threw the corpse at ~50 m/s, a 22× too strong chest; two frames later right).
+func kick_torso(dv: Vector3, point := Vector3.INF) -> void:
+	if bodies.is_empty() or dv.length_squared() < 1e-6:
+		return
+	var total := 0.0
+	for b in bodies.values():
+		total += (b as RigidBody3D).mass
+	var tm: float = (bodies["chest"] as RigidBody3D).mass + (bodies["pelvis"] as RigidBody3D).mass
+	var torso_dv := dv * (total / tm)          # (the whole body's momentum, chest + pelvis alike)
+	for n in ["chest", "pelvis"]:
+		var rb: RigidBody3D = bodies[n]
+		rb.linear_velocity += torso_dv
+		if point != Vector3.INF:
+			var at := (point - rb.global_position).limit_length(0.6)
+			var axis := at.cross(dv)
+			if axis.length_squared() > 1e-6:
+				var w := minf(dv.length() * at.length() * TORSO_SPIN_K, TORSO_SPIN_MAX)
+				rb.angular_velocity += axis.normalized() * w
+
+
+## Impulse `j` (N·s, world) on ragdoll part `rb` at `offset` (world, from the part's origin), as a
+## direct velocity change: j / mass, and a spin of offset × j over the part's inertia (PART_K2; capped
+## at ANG_MAX). Use this instead of apply_impulse() on ragdoll parts: right after start() the physics
+## server has not taken the parts' masses in yet and apply_impulse() acts on a 1 kg body (see
+## kick_torso). Every caller (hit_reactor.gd, net_react.gd) goes through here.
+static func kick_part(rb: RigidBody3D, j: Vector3, offset := Vector3.ZERO) -> void:
+	if rb == null or not is_instance_valid(rb) or not j.is_finite() or not offset.is_finite():
+		return
+	var m := maxf(rb.mass, 0.1)
+	rb.linear_velocity += j / m
+	if offset.length_squared() > 1e-8:
+		var k2: float = float(PART_K2.get(str(rb.name), 0.02))
+		var w := offset.limit_length(0.6).cross(j) / (m * k2)
+		rb.angular_velocity = (rb.angular_velocity + w).limit_length(ANG_MAX)
 
 
 func _joint(a: RigidBody3D, b: RigidBody3D, lim: Array) -> void:
@@ -217,15 +305,41 @@ func orbit(dx: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	_rx_snap()
 	if bodies.is_empty() or _done:
 		return
+	if _resting:
+		_t += delta
+		if not _rest_awake():
+			if _t > _max_t:
+				_finish()
+			return                            # asleep: no per-part work at all
+		_resting = false                      # something woke it (a shove, a dead hit): simulate again
+		_settle = 0.0
 	_t += delta
 	_thud_cd = maxf(_thud_cd - delta, 0.0)
 	var max_dv := 0.0
+	_finite_guard()
+	# Safety: a joint-solver blow-up (bodies starting interpenetrated, a huge off-centre kick) must
+	# never fling the body away: the whole ragdoll is slowed to the cap, keeping its shape.
+	var ps := pelvis().linear_velocity.length()
+	if ps > _speed_cap:
+		var k := _speed_cap / ps
+		for n in bodies:
+			(bodies[n] as RigidBody3D).linear_velocity *= k
+	var pel_v := pelvis().linear_velocity
 	for n in bodies:
 		var b: RigidBody3D = bodies[n]
 		var pos := b.global_position
 		b.constant_force = Game.gravity_at(pos) * b.mass
+		# A limb never races away from the pelvis faster than LIMB_REL_MAX (a shove that reached only
+		# one limb would otherwise pull the joints apart before the solver catches up).
+		if n != "pelvis":
+			var rel := b.linear_velocity - pel_v
+			if rel.length_squared() > LIMB_REL_MAX * LIMB_REL_MAX:
+				b.linear_velocity = pel_v + rel.limit_length(LIMB_REL_MAX)
+		if b.angular_velocity.length_squared() > ANG_MAX * ANG_MAX:
+			b.angular_velocity = b.angular_velocity.limit_length(ANG_MAX)
 		var v := b.linear_velocity
 		var dv: float = (v - _prev_v[n]).length()
 		_prev_v[n] = v
@@ -257,8 +371,85 @@ func _physics_process(delta: float) -> void:
 			zero_g_end = true
 			_finish()
 			return
+	if no_float_recover and not low_g and _t > DEAD_REST_MIN and _settle > DEAD_REST_SETTLE:
+		_rest()
 	if (_t > _min_t and _settle > 0.9) or _t > _max_t:
 		_finish()
+
+
+## Interpolation: remember the part transforms of the last two physics ticks (see _rx_prev).
+func _rx_snap() -> void:
+	for n in bodies:
+		var c: Transform3D = (bodies[n] as RigidBody3D).global_transform
+		_rx_prev[n] = _rx_cur.get(n, c)
+		_rx_cur[n] = c
+
+
+## Part `n`'s transform for drawing this frame: between the last two ticks (the live one as a fallback).
+func _rx(n: String) -> Transform3D:
+	var live: Transform3D = (bodies[n] as RigidBody3D).global_transform
+	if not _rx_cur.has(n) or not _rx_prev.has(n):
+		return live
+	var f := clampf(Engine.get_physics_interpolation_fraction(), 0.0, 1.0)
+	var x: Transform3D = (_rx_prev[n] as Transform3D).interpolate_with(_rx_cur[n], f)
+	if not x.origin.is_finite() or not x.basis.x.is_finite():
+		return live
+	return x
+
+
+## A settled dead body goes to sleep (see DEAD_REST_MIN); _physics_process wakes the loop again when
+## any part is moving.
+func _rest() -> void:
+	_resting = true
+	_rest_posed = false
+	for b in bodies.values():
+		var rb := b as RigidBody3D
+		rb.can_sleep = true
+		rb.constant_force = Vector3.ZERO      # (a held force could keep it awake; the loop puts gravity
+		rb.sleeping = true                    # back the tick anything wakes)
+	# Ground dug away under a sleeping body: wake it so it drops into the hole (Jolt does not wake a
+	# sleeper when the static terrain shape under it changes).
+	var w = Game.body_at(pelvis().global_position)
+	if w != null and is_instance_valid(w) and (w as Object).has_signal("brush_applied") \
+			and not w.brush_applied.is_connected(_on_ground_edit):
+		w.brush_applied.connect(_on_ground_edit)
+
+
+func _on_ground_edit(center: Vector3, radius: float) -> void:
+	if not _resting or bodies.is_empty():
+		return
+	if pelvis().global_position.distance_to(center) > radius + 2.0:
+		return
+	for b in bodies.values():
+		(b as RigidBody3D).sleeping = false
+
+
+func _rest_awake() -> bool:
+	for b in bodies.values():
+		if not (b as RigidBody3D).sleeping:
+			return true
+	return false
+
+
+## Safety (2026-10-07): a non-finite part (a solver blow-up) must never reach the owner, whose get-up /
+## corpse reads the bones (a bot stood up at a NaN position and stayed there). Every part with a
+## non-finite position goes back to the last finite pelvis position, non-finite velocities stop.
+var _last_ok := Vector3.INF
+func _finite_guard() -> void:
+	var pel := pelvis()
+	if pel.global_position.is_finite() and pel.linear_velocity.is_finite():
+		_last_ok = pel.global_position
+	for b in bodies.values():
+		var rb := b as RigidBody3D
+		if not rb.global_position.is_finite() or not rb.global_transform.basis.x.is_finite():
+			if _last_ok == Vector3.INF:
+				continue
+			rb.global_transform = Transform3D(Basis(), _last_ok)
+			rb.linear_velocity = Vector3.ZERO
+			rb.angular_velocity = Vector3.ZERO
+		elif not rb.linear_velocity.is_finite() or not rb.angular_velocity.is_finite():
+			rb.linear_velocity = Vector3.ZERO
+			rb.angular_velocity = Vector3.ZERO
 
 
 ## Safety: if the pelvis tunnelled into solid rock (the edited density field, so dug tunnels and
@@ -281,12 +472,15 @@ func _finish() -> void:
 		return
 	_done = true
 	var c: RigidBody3D = bodies["chest"]
-	var up := _up(pelvis().global_position)
+	var pp := pelvis().global_position
+	if not pp.is_finite() and _last_ok != Vector3.INF:
+		pp = _last_ok                          # (never hand a non-finite spot to the owner)
+	var up := _up(pp)
 	var fwd := -c.global_transform.basis.z
 	fwd -= up * fwd.dot(up)
-	if fwd.length_squared() < 1e-4:
+	if fwd.length_squared() < 1e-4 or not fwd.is_finite():
 		fwd = _cam_fwd
-	finished.emit(pelvis().global_position, fwd.normalized())
+	finished.emit(pp, fwd.normalized())
 
 
 func _process(delta: float) -> void:
@@ -296,12 +490,30 @@ func _process(delta: float) -> void:
 		return
 	if bodies.is_empty():
 		return
-	# Drive the model from the bodies.
+	# Asleep and already posed at rest (for this astronaut: a corpse may have adopted us): nothing moves.
+	if _resting and _rest_posed and _rest_posed_for == astronaut:
+		_update_camera(delta)
+		return
+	# Drive the model from the bodies: the pelvis takes its body's whole transform, every other
+	# bone only its body's ROTATION and sits where its parent bone's rest offset puts it. A joint
+	# the solver lets drift apart (a hard shove, a fast impact) then never stretches the suit's
+	# arms and legs; parents are posed before their children. Transforms drawn between the last two
+	# physics ticks (_rx).
 	astronaut.transform = Transform3D.IDENTITY
-	for n in ["pelvis", "chest", "head", "uarm0", "uarm1", "farm0", "farm1", "thigh0", "thigh1", "shin0", "shin1"]:
-		(_bone_of[n] as Node3D).global_transform = (bodies[n] as RigidBody3D).global_transform
+	(_bone_of["pelvis"] as Node3D).global_transform = _rx("pelvis")
+	astronaut.spine.transform = astronaut.rest_local(astronaut.spine)
+	for n in ["chest", "head", "uarm0", "uarm1", "farm0", "farm1", "thigh0", "thigh1", "shin0", "shin1"]:
+		var bone: Node3D = _bone_of[n]
+		var par := bone.get_parent() as Node3D
+		var at: Vector3 = par.global_transform * astronaut.rest_local(bone).origin
+		bone.global_transform = Transform3D(_rx(n).basis.orthonormalized(), at)
 	for b in _fixed:
 		b.transform = astronaut.rest_local(b)
+	# Resting: once both remembered ticks hold the rest pose, this pose is final until something wakes it.
+	var rp: Transform3D = _rx_prev.get("pelvis", Transform3D())
+	if _resting and rp.is_equal_approx(_rx_cur.get("pelvis", Transform3D())):
+		_rest_posed = true
+		_rest_posed_for = astronaut
 	_update_camera(delta)
 
 
@@ -309,7 +521,7 @@ func _process(delta: float) -> void:
 func _update_camera(delta: float) -> void:
 	if cam == null:
 		return
-	var target: Vector3 = astronaut.hips.global_position if bodies.is_empty() else pelvis().global_position
+	var target: Vector3 = astronaut.hips.global_position if bodies.is_empty() else _rx("pelvis").origin
 	var up := _up(target)
 	var f := _cam_fwd - up * _cam_fwd.dot(up)
 	if f.length_squared() < 1e-4:
@@ -325,7 +537,8 @@ func _update_camera(delta: float) -> void:
 		want = look_at_p.lerp(hit["position"], 0.85)
 	_cam_pos = _cam_pos.lerp(want, 1.0 - exp(-6.0 * delta))
 	_shake = maxf(_shake - delta * 2.5, 0.0)
-	var sh := Vector3(sin(_t * 61.0), sin(_t * 53.0 + 1.0), sin(_t * 47.0 + 2.0)) * 0.06 * _shake
+	_cam_t += delta                    # (frame clock: _t only steps at the physics rate)
+	var sh := Vector3(sin(_cam_t * 61.0), sin(_cam_t * 53.0 + 1.0), sin(_cam_t * 47.0 + 2.0)) * 0.06 * _shake
 	cam.global_position = _cam_pos + sh
 	if cam.global_position.distance_to(look_at_p) > 0.05:
 		cam.look_at(look_at_p, up)

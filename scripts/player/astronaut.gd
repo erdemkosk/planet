@@ -65,6 +65,15 @@ uniform float rim = 0.2;
 uniform float rim_tint = 0.5;
 uniform float dust = 0.5;
 uniform vec3 dust_color : source_color = vec3(0.5, 0.44, 0.36);
+// Team palette (set_team_palette): accent = self-lit stripes (the enemy's red), team_rim = a fresnel
+// edge that grows with the view distance (0 inside team_rim_near, full at team_rim_far) so far bodies
+// read as team-coloured silhouettes; part of the opaque surface, so it is depth tested like the suit.
+uniform vec3 accent : source_color = vec3(0.0);
+uniform vec3 team_rim : source_color = vec3(0.0);
+uniform float team_rim_k = 0.0;
+uniform float team_rim_fill = 0.0;
+uniform float team_rim_near = 10.0;
+uniform float team_rim_far = 70.0;
 
 float hash(vec2 p) {
 	return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
@@ -121,6 +130,13 @@ void fragment() {
 	RIM_TINT = rim_tint;
 	CLEARCOAT = coat * (1.0 - dn);
 	CLEARCOAT_ROUGHNESS = 0.18;
+	vec3 em = accent * (1.0 - dn * 0.7);
+	if (team_rim_k > 0.0) {
+		float far_k = smoothstep(team_rim_near, team_rim_far, length(VERTEX));
+		float fr = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 2.0);
+		em += team_rim * (team_rim_k * far_k * (fr + team_rim_fill));
+	}
+	EMISSION = em;
 }
 """
 
@@ -129,6 +145,7 @@ shader_type spatial;
 render_mode cull_back;
 
 uniform vec3 tint : source_color = vec3(1.0, 0.72, 0.3);
+uniform vec3 glow : source_color = vec3(0.0);     // self-lit visor (the enemy's red glow)
 
 void fragment() {
 	vec3 r = reflect(-VIEW, NORMAL);
@@ -144,7 +161,7 @@ void fragment() {
 	ROUGHNESS = 0.05;
 	SPECULAR = 1.0;
 	METALLIC = 0.6;
-	EMISSION = env * tint * fres * 0.85;
+	EMISSION = env * tint * fres * 0.85 + glow * (0.75 + 0.25 * fres);
 }
 """
 
@@ -153,11 +170,13 @@ shader_type spatial;
 render_mode cull_back;
 
 uniform float energy = 2.6;
+uniform vec4 recolor : source_color = vec4(1.0, 1.0, 1.0, 0.0);   // a = how much the lights take rgb (team palette)
 
 void fragment() {
-	ALBEDO = COLOR.rgb * 0.15;
+	vec3 c = mix(COLOR.rgb, recolor.rgb * max(COLOR.r, max(COLOR.g, COLOR.b)), recolor.a);
+	ALBEDO = c * 0.15;
 	ROUGHNESS = 0.35;
-	EMISSION = COLOR.rgb * energy;
+	EMISSION = c * energy;
 }
 """
 
@@ -250,6 +269,21 @@ var _bank := 0.0
 var _look := Vector2.ZERO        # idle glance (yaw, pitch)
 var _look_to := Vector2.ZERO
 var _look_t := 2.0
+# Stances (animate keys "crouch" / "slide", 0..1) and the hit reaction (hit_react()).
+var _crouch := 0.0
+var _slide := 0.0
+var _hr := Vector3.ZERO          # hit reaction spring: torso pitch, yaw, roll (rad)
+var _hr_v := Vector3.ZERO
+var _hr_head := 0.0              # head snap (head hits)
+var _hr_head_v := 0.0
+# First-person body view (the local player's own body while sliding / looking down, set_legs_view()).
+var _legs_skel: Skeleton3D
+var _legs_mesh: MeshInstance3D
+var _legs_a := 0.0
+var _legs_mats: Array = []       # the view's own materials (eye fade, back cut uniforms per frame)
+var _legs_eye := Vector3.ZERO    # camera position (this node's space)
+var _legs_off := Vector3.ZERO    # smoothed shift that puts the neck just under / behind the eye
+var _legs_snap := true
 
 
 static func mat(c: Color, rough := 0.7, metal := 0.0, weave := 0.0, rim := 0.25) -> ShaderMaterial:
@@ -324,6 +358,7 @@ static func body_mesh() -> ArrayMesh:
 func _ready() -> void:
 	process_priority = 100        # sync the skeleton after animation / ragdoll moved the bones
 	_build()
+	_auto_palette()               # friend / enemy colours from the owner's team ("Team palette")
 
 
 # ------------------------------------------------------------------------------------------
@@ -492,6 +527,8 @@ func reset_pose() -> void:
 	for b in _bones:
 		b.transform = _rest[b]
 		_rot[b] = Vector3.ZERO
+	_hit_clear()
+	_bl_clear()                          # (body language, end of file)
 
 
 ## Copies the Node3D bones into the skeleton (after animation / ragdoll / get-up moved them).
@@ -506,6 +543,529 @@ func sync_skeleton() -> void:
 		var t: Transform3D = (_bone_nodes[i] as Node3D).transform
 		_skel.set_bone_pose_position(i, t.origin)
 		_skel.set_bone_pose_rotation(i, t.basis.get_rotation_quaternion())
+	if _legs_mesh != null and _legs_mesh.visible:
+		_sync_legs()
+
+
+# --- Hit reaction ----------------------------------------------------------------------------
+# Everything here is additive on top of the animated pose (never kept in _rot), stepped in _step_hit
+# while _hr_on, applied in animate (torso / legs before the hold IK, arms after it):
+#   _hr / _hr_head   torso snap and head snap away from the hit (the original flinch)
+#   _hs              per-bone hit springs, bone -> [rotation vector, angular velocity] in the bone's
+#                    parent space: apply_hit() turns the hit's push AT ITS POINT into a torque about
+#                    every joint from the struck bone up to the hips (a partial "active ragdoll"), so
+#                    WHERE the body is struck decides how it reels: the head snaps back, a shoulder
+#                    twists the torso to that side and throws the arm back, a side hit twists, a
+#                    thigh swings back
+#   _fold            gut / pelvis hit: doubles over (an active response, held a moment)
+#   _buckle[i]       leg hit: that knee buckles and the hip drops (a strong one: down on that knee);
+#                    _limp[i] then limps on it for LIMP_TIME s
+#   _stg / _stg_dir  stagger balance (set_stagger, scripts/player/hit_reactor.gd): torso bent with the
+#                    shove, head forward, arms out
+# hit_react(dir, k, head) is the old one-call flinch (gun_feel, melee, pusher call it right after the
+# damage). When the owner has a reactor (`reactor`, hit_reactor.gd) it goes there instead: the hits of
+# one physics frame become ONE reaction with every hit's bone (no double flinch); without one it is
+# apply_hit without a point. Hit zones = ragdoll part names: part_at(point), part_point(part).
+
+const LIMP_TIME := 1.8                 # s a leg hit limps
+const HS_GAIN := {"hips": 3.0, "spine": 8.0, "chest": 12.0, "head": 28.0, "shoulder": 55.0, "elbow": 40.0,
+		"thigh": 24.0, "shin": 18.0}  # rad/s per unit torque (m) at full strength
+const HS_FALLOFF := 0.65               # per joint up the chain
+const TORSO_W := {"head": 0.5, "chest": 1.0, "pelvis": 0.8, "uarm": 0.6, "farm": 0.35, "thigh": 0.35, "shin": 0.2}
+
+var reactor = null                     # scripts/player/hit_reactor.gd of the owner (set by it), or null
+var _hs := {}
+var _fold := 0.0
+var _fold_s := 0.0
+var _fold_t := 0.0
+var _buckle := [0.0, 0.0]
+var _buckle_s := [0.0, 0.0]
+var _buckle_t := [0.0, 0.0]
+var _limp := [0.0, 0.0]
+var _stg := 0.0
+var _stg_to := 0.0
+var _stg_dir := Vector3.BACK
+var _hp_off := Vector3.ZERO            # pelvis offset / rotation of the hit pose, applied before the leg IK
+var _hp_rot := Vector3.ZERO            # (so the feet stay planted: _hit_pelvis)
+var _hr_on := false
+
+
+## A bullet / blast hit the body: a short directional flinch (torso snaps away from the hit, a head
+## hit snaps the head back). dir: world direction the hit travelled; k: strength (~0.25 .. 1.2).
+func hit_react(dir: Vector3, k: float, head_hit := false) -> void:
+	if reactor != null and reactor.route_flinch(dir, k, head_hit):
+		return
+	apply_hit(dir, k, head_hit)
+
+
+## One hit: dir = world direction it pushes, k = strength (~0.2 .. 1.5), point = where it struck
+## (world; INF = unknown: a plain torso / head flinch).
+func apply_hit(dir: Vector3, k: float, head_hit := false, point := Vector3.INF) -> void:
+	if dir.length_squared() < 1e-6:
+		return
+	var l := global_transform.basis.orthonormalized().inverse() * dir.normalized()
+	var s := clampf(k, 0.0, 1.5)
+	var part := "chest"
+	if head_hit:
+		part = "head"
+	elif point != Vector3.INF:
+		part = part_at(point)
+	var kind := part.rstrip("01")
+	var tw: float = float(TORSO_W.get(kind, 1.0)) * (0.6 if point != Vector3.INF else 1.0)
+	_hr_v += Vector3(l.z * 7.0, randf_range(-1.0, 1.0) * 2.5 + l.x * 2.0, -l.x * 6.0) * s * tw
+	if head_hit:
+		_hr_head_v += 13.0 * s * (1.0 if l.z >= 0.0 else -1.0)
+	if point != Vector3.INF:
+		_torque_chain(part, global_transform.affine_inverse() * point, l, s)
+	var i := 0 if part.ends_with("0") else 1
+	match kind:
+		"pelvis":
+			_fold = maxf(_fold, clampf(s * 0.9, 0.25, 1.0))
+			_fold_t = 0.2 + 0.35 * s
+		"thigh", "shin":
+			_buckle[i] = maxf(_buckle[i], clampf(s * 0.75, 0.15, 1.0))
+			_buckle_t[i] = 0.15 + 0.4 * s
+			_limp[i] = maxf(_limp[i], clampf(s * 1.2, 0.35, 1.0))
+	_hr_on = true
+	_bl_hit(s)                           # a hard hit cuts a gesture short (body language, end of file)
+
+
+## Stagger balance pose: w 0..1, dir_local = the way the body is being shoved (this node's space).
+func set_stagger(w: float, dir_local := Vector3.ZERO) -> void:
+	_stg_to = clampf(w, 0.0, 1.0)
+	var d := Vector3(dir_local.x, 0.0, dir_local.z)
+	if d.length_squared() > 1e-6:
+		_stg_dir = d.normalized()
+	if _stg_to > 0.0:
+		_hr_on = true
+
+
+## 0..1: how hard it limps right now (the reactor slows the walk by it).
+func limp_amount() -> float:
+	return maxf(_limp[0], _limp[1])
+
+
+## The hit's push at root-space point `pl` along root-space direction `l` as an angular kick on the
+## struck bone and, weaker, on each joint up to the hips (a rotation vector in the parent's space).
+func _torque_chain(part: String, pl: Vector3, l: Vector3, s: float) -> void:
+	var b: Node3D = _part_bone(part)
+	var inv := global_transform.affine_inverse()
+	var lvl := 0
+	while b != null and lvl < 4:
+		var bx: Transform3D = inv * b.global_transform
+		var tq := (pl - bx.origin).cross(l)
+		var pb := Basis() if b == hips else (inv * (b.get_parent() as Node3D).global_transform).basis.orthonormalized()
+		var e: Array = _hs.get(b, [Vector3.ZERO, Vector3.ZERO])
+		e[1] = (e[1] as Vector3) + pb.inverse() * tq * float(HS_GAIN.get(_bone_kind(b), 10.0)) * s * pow(HS_FALLOFF, float(lvl))
+		_hs[b] = e
+		if b == hips:
+			break
+		b = b.get_parent() as Node3D
+		lvl += 1
+
+
+func _part_bone(part: String) -> Node3D:
+	var i := 0 if part.ends_with("0") else 1
+	match part.rstrip("01"):
+		"head":
+			return head
+		"pelvis":
+			return spine
+		"uarm":
+			return shoulder[i]
+		"farm":
+			return elbow[i]
+		"thigh":
+			return thigh[i]
+		"shin":
+			return shin[i]
+	return chest
+
+
+func _bone_kind(b: Node3D) -> String:
+	if b == hips:
+		return "hips"
+	if b == spine:
+		return "spine"
+	if b == chest:
+		return "chest"
+	if b == head:
+		return "head"
+	if b in shoulder:
+		return "shoulder"
+	if b in elbow:
+		return "elbow"
+	if b in thigh:
+		return "thigh"
+	if b in shin:
+		return "shin"
+	return ""
+
+
+## Body segments in world space: [part, a, b, radius] (the ragdoll's part names, 0 = left).
+func _segments() -> Array:
+	var hx: Transform3D = hips.global_transform
+	var cx: Transform3D = chest.global_transform
+	var hd: Transform3D = head.global_transform
+	var out := [["pelvis", hx * Vector3(0, -0.12, 0), cx.origin, 0.17],
+			["chest", cx.origin, cx * Vector3(0, 0.42, 0), 0.22],
+			["head", hd * Vector3(0, 0.05, 0), hd * Vector3(0, 0.27, 0), 0.17]]
+	for i in 2:
+		out.append(["uarm%d" % i, (shoulder[i] as Node3D).global_position, (elbow[i] as Node3D).global_position, 0.07])
+		out.append(["farm%d" % i, (elbow[i] as Node3D).global_position, (hand[i] as Node3D).global_position, 0.06])
+		out.append(["thigh%d" % i, (thigh[i] as Node3D).global_position, (shin[i] as Node3D).global_position, 0.09])
+		out.append(["shin%d" % i, (shin[i] as Node3D).global_position, (foot[i] as Node3D).global_position, 0.08])
+	return out
+
+
+## The body part (ragdoll part name) nearest to world point p.
+func part_at(p: Vector3) -> String:
+	var best := "chest"
+	var bd := INF
+	for sg in _segments():
+		var d: float = p.distance_to(Geometry3D.get_closest_point_to_segment(p, sg[1], sg[2])) - float(sg[3])
+		if d < bd:
+			bd = d
+			best = sg[0]
+	return best
+
+
+## The point on the body nearest to world point p (a blast's centre: where its push lands).
+func closest_on_body(p: Vector3) -> Vector3:
+	var best := chest.global_position
+	var bd := INF
+	for sg in _segments():
+		var c := Geometry3D.get_closest_point_to_segment(p, sg[1], sg[2])
+		var d: float = p.distance_to(c) - float(sg[3])
+		if d < bd:
+			bd = d
+			best = c
+	return best
+
+
+## Middle of a body part (world): a mirror of a remote hit by its part name.
+func part_point(part: String) -> Vector3:
+	for sg in _segments():
+		if sg[0] == part:
+			return ((sg[1] as Vector3) + (sg[2] as Vector3)) * 0.5
+	return chest.global_position
+
+
+func _hit_clear(limp := true) -> void:
+	_hr = Vector3.ZERO
+	_hr_v = Vector3.ZERO
+	_hr_head = 0.0
+	_hr_head_v = 0.0
+	_hs.clear()
+	_fold = 0.0
+	_fold_s = 0.0
+	_fold_t = 0.0
+	_buckle = [0.0, 0.0]
+	_buckle_s = [0.0, 0.0]
+	_buckle_t = [0.0, 0.0]
+	_stg = 0.0
+	_stg_to = 0.0
+	_hp_off = Vector3.ZERO
+	_hp_rot = Vector3.ZERO
+	if limp:
+		_limp = [0.0, 0.0]
+		_hr_on = false
+
+
+func _step_hit(delta: float) -> void:
+	if delta > 0.2:
+		# Far / slow LOD: no visible flinch, just settle.
+		_hit_clear(false)
+		_limp = [maxf(_limp[0] - delta / LIMP_TIME, 0.0), maxf(_limp[1] - delta / LIMP_TIME, 0.0)]
+		_hr_on = limp_amount() > 0.0
+		return
+	var n := int(ceilf(delta / 0.016))
+	var h := delta / float(maxi(n, 1))
+	for i in n:
+		_hr_v += (-_hr * 220.0 - _hr_v * 18.0) * h
+		_hr += _hr_v * h
+		_hr_head_v += (-_hr_head * 260.0 - _hr_head_v * 16.0) * h
+		_hr_head += _hr_head_v * h
+		for b in _hs:
+			var e: Array = _hs[b]
+			var kc := _hs_spring(b)
+			e[1] = (e[1] as Vector3) + (-(e[0] as Vector3) * kc.x - (e[1] as Vector3) * kc.y) * h
+			e[0] = ((e[0] as Vector3) + (e[1] as Vector3) * h).limit_length(kc.z)
+	var k := 1.0 - exp(-16.0 * delta)
+	_fold_t -= delta
+	if _fold_t <= 0.0:
+		_fold = move_toward(_fold, 0.0, delta * 2.0)
+	_fold_s = lerpf(_fold_s, _fold, k)
+	for i in 2:
+		_buckle_t[i] = float(_buckle_t[i]) - delta
+		if float(_buckle_t[i]) <= 0.0:
+			_buckle[i] = move_toward(float(_buckle[i]), 0.0, delta * 1.8)
+		_buckle_s[i] = lerpf(float(_buckle_s[i]), float(_buckle[i]), k)
+		_limp[i] = maxf(float(_limp[i]) - delta / LIMP_TIME, 0.0)
+	_stg = lerpf(_stg, _stg_to, 1.0 - exp(-10.0 * delta))
+	if _stg_to <= 0.0 and _stg < 0.002:
+		_stg = 0.0
+	var springs := false
+	for b in _hs:
+		var e: Array = _hs[b]
+		if (e[0] as Vector3).length_squared() > 1e-6 or (e[1] as Vector3).length_squared() > 1e-4:
+			springs = true
+			break
+	if not springs:
+		_hs.clear()
+	if _hr.length_squared() < 1e-8 and _hr_v.length_squared() < 1e-6 and absf(_hr_head) < 1e-4 and absf(_hr_head_v) < 1e-3:
+		_hr = Vector3.ZERO
+		_hr_v = Vector3.ZERO
+		_hr_head = 0.0
+		_hr_head_v = 0.0
+		if not springs and _fold_s < 0.002 and _fold <= 0.0 and float(_buckle_s[0]) < 0.002 and float(_buckle_s[1]) < 0.002 \
+				and float(_buckle[0]) <= 0.0 and float(_buckle[1]) <= 0.0 and limp_amount() <= 0.0 and _stg <= 0.0 and _stg_to <= 0.0:
+			_hr_on = false
+			_hp_off = Vector3.ZERO
+			_hp_rot = Vector3.ZERO
+
+
+## Spring of a hit bone: x = stiffness, y = damping, z = max angle (rad).
+func _hs_spring(b: Node3D) -> Vector3:
+	if b == hips:
+		return Vector3(150.0, 15.0, 0.25)
+	if b == head:
+		return Vector3(200.0, 17.0, 0.8)
+	if b in shoulder or b in elbow:
+		return Vector3(80.0, 9.0, 1.3)
+	if b in thigh or b in shin:
+		return Vector3(110.0, 12.0, 0.8)
+	return Vector3(150.0, 15.0, 0.8)
+
+
+## Pelvis part of the hit reaction (animate, before the leg IK, so the IK keeps the feet planted):
+## a buckled leg drops the hips and that side (the knee goes down: its foot target moves back too), a
+## limp dips them while the hurt foot carries the weight, a gut hit sits them back, a stagger leans
+## them with the shove.
+func _hit_pelvis(stance: float, gait: float) -> void:
+	var off := Vector3(0.0, -0.06 * _fold_s, 0.07 * _fold_s)
+	var rot := Vector3(-0.12 * _fold_s, 0.0, 0.0)
+	for i in 2:
+		var side := -1.0 if i == 0 else 1.0
+		var b := float(_buckle_s[i])
+		var p := fmod(_phase + (0.0 if i == 0 else 0.5), 1.0)
+		var lm := float(_limp[i]) * (sin(PI * p / stance) if p < stance else 0.0) * gait
+		off.y -= 0.36 * b + 0.07 * lm
+		rot.z -= side * (0.12 * b + 0.09 * lm)
+	if _stg > 0.001:
+		rot += Vector3(_stg_dir.z * 0.16, 0.0, -_stg_dir.x * 0.14) * _stg
+	_hp_off = off
+	_hp_rot = rot
+
+
+## Torso and head part of the hit reaction (after the leg IK, before the hold IK).
+func _hit_body_pose(_gait: float, _stance: float) -> void:
+	hips.rotation += Vector3(_hr.x * 0.15, 0.0, _hr.z * 0.2)
+	spine.rotation += _hr * 0.35
+	chest.rotation += _hr * 0.65
+	head.rotation += _hr * 0.4 + Vector3(_hr_head, 0.0, 0.0)
+	if _fold_s > 0.001:
+		# Gut: doubles over (spine and chest curl forward, the head up to keep looking).
+		var f := _fold_s
+		spine.rotation.x -= 0.4 * f
+		chest.rotation.x -= 0.3 * f
+		head.rotation.x += 0.3 * f
+	for i in 2:
+		# A buckled leg tilts the hips (_hit_pelvis): the spine leans back over the other one.
+		var b := float(_buckle_s[i])
+		if b > 0.001:
+			spine.rotation.z += (-1.0 if i == 0 else 1.0) * 0.08 * b
+	if _stg > 0.001:
+		# Stagger: leaning with the shove (back when shoved back, sideways when shoved sideways; the
+		# pelvis part in _hit_pelvis), the head forward.
+		var sd := _stg_dir
+		spine.rotation += Vector3(sd.z * 0.14 - 0.06, 0.0, -sd.x * 0.12) * _stg
+		chest.rotation += Vector3(sd.z * 0.1, 0.0, -sd.x * 0.08) * _stg
+		head.rotation += Vector3(-sd.z * 0.3, 0.0, sd.x * 0.18) * _stg
+	for b in _hs:
+		if not (b in shoulder or b in elbow):
+			_add_rotvec(b, _hs[b][0])
+
+
+## Arms part of the hit reaction (after the hold IK: a struck arm leaves the gun).
+func _hit_arms_pose() -> void:
+	for i in 2:
+		var side := -1.0 if i == 0 else 1.0
+		if _fold_s > 0.001:
+			_add_rotvec(shoulder[i], Vector3(0.45, 0.0, 0.0) * _fold_s)
+			_add_rotvec(elbow[i], Vector3(0.6, 0.0, 0.0) * _fold_s)
+		if _stg > 0.001:
+			_add_rotvec(shoulder[i], Vector3(0.3, 0.0, side * 0.9) * _stg)
+			_add_rotvec(elbow[i], Vector3(0.45, 0.0, 0.0) * _stg)
+	for b in _hs:
+		if b in shoulder or b in elbow:
+			_add_rotvec(b, _hs[b][0])
+
+
+## Rotates bone b by rotation vector v given in its parent's space.
+static func _add_rotvec(b: Node3D, v: Vector3) -> void:
+	var a := v.length()
+	if a > 1e-5:
+		b.basis = Basis(v / a, a) * b.basis
+
+
+# --- First-person legs view ------------------------------------------------------------------
+
+## Shows this body to its own camera (the local player while sliding / looking down). a: 0..1 fade;
+## eye: the camera position in this node's space; delta: frame time (offset smoothing).
+## A second skinned instance of the whole suit on its own skeleton that copies the animated bones;
+## only the helmet (head bone) and the arms (shoulder bones: the view model's arms are the real
+## ones) are collapsed. The torso stays whole: legs → hips → belt → belly → chest are one surface.
+## Placement (the camera never inside the torso): the eye is where the visor would be, FP_NECK_DROP
+## above the neck ring (player.gd EYE_H, stance.gd EYE_CROUCH / EYE_SLIDE are matched to the poses),
+## and the body sits behind it like a head pivoting on the neck: FP_NECK_BACK behind when looking
+## ahead, FP_NECK_BACK_DOWN behind when looking straight down, so the view ray passes in front of
+## the chest plate and the chest, belly, belt, hips and legs all lie in front of and below the
+## camera. The body is never lifted (feet would float); a pose whose neck is too high is sunk a
+## little. Its own materials dissolve only what is within FP_NEAR..FP_FAR of the eye (the collar
+## ring) with a dither, and drop the life-support pack (the back half above the waist, it would
+## hang at the bottom edge of the view). No shadow: the shadow-only main body casts the real one.
+const FP_NEAR := 0.1
+const FP_FAR := 0.17
+const FP_NECK_DROP := 0.12        # m the neck ring sits below the eye
+const FP_NECK_BACK := 0.07        # m the neck sits behind the eye, looking ahead...
+const FP_NECK_BACK_DOWN := 0.25   # ...and looking straight down (the chest plate front is 0.14 m ahead of the neck)
+const FP_NECK_SLACK := 0.04       # m the neck may sit above its place before the body is lowered
+const FP_MAX_SHIFT := 0.5         # m of horizontal shift at most
+const FP_MAX_SINK := 0.2          # m the body may be lowered (a pose whose neck is above its place)
+
+func set_legs_view(a: float, eye := Vector3.INF, delta := 0.016, pitch := 0.0) -> void:
+	a = clampf(a, 0.0, 1.0)
+	if a <= 0.001 and _legs_mesh == null:
+		return
+	if _legs_mesh == null:
+		_build_legs_view()
+	_legs_a = a
+	var on := a > 0.001
+	if _legs_mesh.visible != on:
+		_legs_mesh.visible = on
+		_legs_snap = true
+	if not on:
+		return
+	if eye != Vector3.INF:
+		_legs_eye = eye
+		# Neck (head bone) of the current pose in this node's space.
+		var neck: Vector3 = hips.transform * (spine.transform * (chest.transform * head.position))
+		var down := smoothstep(0.3, 1.35, -pitch)
+		var back := lerpf(FP_NECK_BACK, FP_NECK_BACK_DOWN, down)
+		var want := _legs_eye + Vector3(0.0, -FP_NECK_DROP, back) - neck
+		var hz := Vector2(want.x, want.z).limit_length(FP_MAX_SHIFT)
+		var tgt := Vector3(hz.x, clampf(want.y + FP_NECK_SLACK, -FP_MAX_SINK, 0.0), hz.y)
+		_legs_off = tgt if _legs_snap else _legs_off.lerp(tgt, 1.0 - exp(-14.0 * delta))
+		_legs_snap = false
+	for m in _legs_mats:
+		(m as ShaderMaterial).set_shader_parameter("fp_alpha", a)
+	_sync_legs()
+
+
+func _build_legs_view() -> void:
+	_legs_skel = Skeleton3D.new()
+	add_child(_legs_skel)
+	for i in AP.BONE_COUNT:
+		_legs_skel.add_bone(AP.BONE_NAMES[i])
+	for i in AP.BONE_COUNT:
+		if AP.BONE_PARENT[i] >= 0:
+			_legs_skel.set_bone_parent(i, AP.BONE_PARENT[i])
+		var rest := Transform3D(Basis(), AP.bone_local(i))
+		_legs_skel.set_bone_rest(i, rest)
+		_legs_skel.set_bone_pose(i, rest)
+	_legs_mesh = MeshInstance3D.new()
+	_legs_mesh.mesh = body_mesh()
+	_legs_mesh.skin = _body_skin
+	_legs_mesh.custom_aabb = AABB(Vector3(-2.4, -2.4, -2.4), Vector3(4.8, 4.8, 4.8))
+	_legs_mesh.skeleton = NodePath("..")
+	_legs_mesh.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_legs_mesh.layers = _body.layers if _body != null else 2
+	_legs_mesh.visible = false
+	_legs_skel.add_child(_legs_mesh)
+	# Own materials: the suit's shaders plus the eye dissolve and the back cut.
+	_legs_mats.clear()
+	for si in _legs_mesh.mesh.get_surface_count():
+		var src := _legs_mesh.mesh.surface_get_material(si) as ShaderMaterial
+		if src == null or src.shader == null:
+			continue
+		var m := ShaderMaterial.new()
+		var sh := Shader.new()
+		sh.code = _fp_code(src.shader.code)
+		m.shader = sh
+		# The suit materials' parameters (BODY_SHADER / VISOR_SHADER / GLOW_SHADER uniforms).
+		for nm in ["albedo", "roughness", "metallic", "fabric", "coat", "rim", "rim_tint", "dust", "dust_color", "tint", "energy"]:
+			var v = src.get_shader_parameter(nm)
+			if v != null:
+				m.set_shader_parameter(nm, v)
+		m.set_shader_parameter("fp_near", FP_NEAR)
+		m.set_shader_parameter("fp_far", FP_FAR)
+		_legs_mesh.set_surface_override_material(si, m)
+		_legs_mats.append(m)
+
+
+## A suit shader turned into its first-person variant: a vertex() that hands the world position to
+## the fragment, which then (a) drops the back half above the waist in the chest's frame and (b)
+## dissolves everything near the eye with interleaved-gradient-noise dithering (opaque, no sorting).
+static func _fp_code(code: String) -> String:
+	var decl := """
+uniform float fp_near = 0.1;
+uniform float fp_far = 0.17;
+uniform float fp_alpha = 1.0;
+uniform vec3 fp_origin = vec3(0.0);
+uniform vec3 fp_back = vec3(0.0, 0.0, 1.0);
+uniform vec3 fp_up = vec3(0.0, 1.0, 0.0);
+varying vec3 fp_world;
+"""
+	var funcs := """
+float fp_ign(vec2 p) {
+	return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+void vertex() {
+	fp_world = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+}
+
+"""
+	var cut := """
+	vec3 fp_rel = fp_world - fp_origin;
+	if (dot(fp_rel, fp_back) > 0.15 && dot(fp_rel, fp_up) > -0.17) {
+		discard;
+	}
+	float fp_k = smoothstep(fp_near, fp_far, length(VERTEX)) * fp_alpha;
+	if (fp_k < 0.999 && fp_k <= fp_ign(FRAGCOORD.xy)) {
+		discard;
+	}
+"""
+	var i := code.find("render_mode")
+	var e := code.find(";", i) if i >= 0 else -1
+	var out := code
+	if e >= 0:
+		out = code.substr(0, e + 1) + "\n" + decl + code.substr(e + 1)
+	else:
+		out = code.replace("shader_type spatial;", "shader_type spatial;\n" + decl)
+	# Helpers and vertex() after the shader's own declarations, right before its fragment().
+	return out.replace("void fragment() {", funcs + "void fragment() {" + cut)
+
+
+func _sync_legs() -> void:
+	for i in AP.NODE_BONES:
+		var t: Transform3D = (_bone_nodes[i] as Node3D).transform
+		_legs_skel.set_bone_pose_position(i, t.origin)
+		_legs_skel.set_bone_pose_rotation(i, t.basis.get_rotation_quaternion())
+	# The helmet and the arms are the camera's / the view model's: collapse them. The torso stays.
+	_legs_skel.set_bone_pose_scale(AP.HEAD, Vector3.ONE * 0.001)
+	_legs_skel.set_bone_pose_scale(AP.SHOULDER_L, Vector3.ONE * 0.001)
+	_legs_skel.set_bone_pose_scale(AP.SHOULDER_R, Vector3.ONE * 0.001)
+	_legs_skel.position = _legs_off
+	# The back cut follows the chest (frame of the posed chest bone, world space).
+	var cx: Transform3D = _legs_skel.global_transform * (hips.transform * spine.transform * chest.transform)
+	var cb := cx.basis.orthonormalized()
+	for m in _legs_mats:
+		var sm := m as ShaderMaterial
+		sm.set_shader_parameter("fp_origin", cx.origin)
+		sm.set_shader_parameter("fp_back", cb.z)
+		sm.set_shader_parameter("fp_up", cb.y)
 
 
 ## Hand i: 0 = relaxed open hand, 1 = closed around a handle (swaps the glove variants).
@@ -640,6 +1200,140 @@ func set_tool_color(c: Color) -> void:
 	_prop_glow.emission = c
 
 
+# --- Team palette (readability, 2026-10-06) ---------------------------------------------------
+# The suit's colours RELATIVE TO THE LOCAL PLAYER, so friend and foe read at a glance: a friend keeps
+# the white / orange suit, an enemy wears charcoal / graphite with self-lit red stripes, a red visor
+# glow, red chest strips and a red helmet lamp, popping against the grey regolith and the black sky.
+# Both get a team-coloured fresnel rim that grows with the view distance (none inside TEAM_RIM_NEAR,
+# full by TEAM_RIM_FAR): a far enemy is a red-edged silhouette, a far friend a faint cyan one. The
+# rim is emission on the suit's own opaque surface (BODY_SHADER), depth tested like the rest of it:
+# it never shows through terrain. Per-instance surface overrides of shared, cached materials (no
+# material_overlay: the scanner's / railgun's x-ray uses that).
+# Auto (_ready): the nearest ancestor with a String `team` decides it: "rival" = enemy, "home" =
+# friend (ai_rival.gd bots incl. ally bots, net_bot.gd, remote_avatar.gd, training_dummy.gd, a skiff
+# seat). Multiplayer: those teams are already local (Net.local_team(side): "rival" is the other side
+# on each machine), so each machine colours the other side red. No team (the local player, the
+# inventory preview) keeps the plain suit without a rim. set_team_palette() overrides (corpse.gd
+# copies the dead body's, without the rim).
+const PAL_PLAIN := 0
+const PAL_FRIEND := 1
+const PAL_ENEMY := 2
+const TEAM_RIM_NEAR := 10.0            # m: no rim this close...
+const TEAM_RIM_FAR := 70.0             # ...full rim from here on
+## Per palette: rim colour, strength, flat fill (a far body is mostly edge; the fill lifts its middle).
+const TEAM_RIM_SPEC := {1: [Color(0.35, 0.8, 1.0), 0.45, 0.04], 2: [Color(1.0, 0.13, 0.05), 1.6, 0.16]}
+const ENEMY_LIGHT := Color(1.0, 0.18, 0.08)
+const ENEMY_ACCENT := Color(0.85, 0.06, 0.02)        # self-lit red of the stripes (×1, linear)
+const ENEMY_VISOR_TINT := Color(1.0, 0.32, 0.22)
+const ENEMY_VISOR_GLOW := Color(0.6, 0.05, 0.02)
+const _PAL_PARAMS := ["albedo", "roughness", "metallic", "fabric", "coat", "rim", "rim_tint", "dust", "dust_color", "tint", "energy"]
+const _PAL_SPEC_KEYS := ["albedo", "roughness", "metallic", "fabric", "coat", "rim", "dust"]
+
+static var _pal_mats := {}             # "palette|rim" -> {surface id: ShaderMaterial}
+
+var team_palette := -1                 # PAL_*; -1 until _ready decides it (or set_team_palette)
+var _pal_rim := true
+var _lamp_idle := 0.25                 # helmet lamp lens energy while the lamp is off
+
+
+## PAL_PLAIN / PAL_FRIEND / PAL_ENEMY; rim: the distance rim (off for corpses).
+func set_team_palette(pal: int, rim := true) -> void:
+	team_palette = clampi(pal, PAL_PLAIN, PAL_ENEMY)
+	_pal_rim = rim
+	if _body == null:
+		return                             # applied in _ready
+	var mats := {} if team_palette == PAL_PLAIN else _palette_set(team_palette, rim)
+	for si in _body.mesh.get_surface_count():
+		_body.set_surface_override_material(si, mats.get(si, null))
+	var enemy := team_palette == PAL_ENEMY
+	var lc := ENEMY_LIGHT if enemy else Color(0.75, 0.95, 1.0)
+	_lights_mat.albedo_color = lc
+	_lights_mat.emission = lc
+	var lamp := ENEMY_LIGHT if enemy else Color(1.0, 0.93, 0.8)
+	_lamp_mat.albedo_color = lamp
+	_lamp_mat.emission = lamp
+	_lamp_idle = 2.2 if enemy else 0.25
+	_lamp_mat.emission_energy_multiplier = _lamp_idle
+
+
+func is_enemy_palette() -> bool:
+	return team_palette == PAL_ENEMY
+
+
+func _auto_palette() -> void:
+	if team_palette >= 0:
+		set_team_palette(team_palette, _pal_rim)
+		return
+	if preview:
+		team_palette = PAL_PLAIN
+		return
+	var n := get_parent()
+	var hops := 0
+	while n != null and hops < 6:
+		if n == Game.player:
+			break
+		var t = n.get("team")
+		if t is String and (t == "rival" or t == "home"):
+			set_team_palette(PAL_ENEMY if t == "rival" else PAL_FRIEND, true)
+			return
+		n = n.get_parent()
+		hops += 1
+	team_palette = PAL_PLAIN
+
+
+## The shared material set of a palette: the base suit's materials with the palette's colours and
+## (rim) the distance rim; cached per palette.
+static func _palette_set(pal: int, rim: bool) -> Dictionary:
+	var key := "%d|%d" % [pal, int(rim)]
+	if _pal_mats.has(key):
+		return _pal_mats[key]
+	var base := body_mesh()
+	# [albedo, roughness, metallic, fabric, coat, rim, dust] like body_mesh(): the enemy's graphite suit.
+	var spec := {}
+	if pal == PAL_ENEMY:
+		spec = {
+			AP.M_FABRIC: [Color(0.15, 0.155, 0.165), 0.9, 0.0, 1.0, 0.0, 0.3, 0.45],
+			AP.M_SHELL: [Color(0.2, 0.205, 0.22), 0.36, 0.1, 0.0, 0.5, 0.15, 0.35],
+			AP.M_GREY: [Color(0.29, 0.3, 0.32), 0.5, 0.25, 0.0, 0.1, 0.15, 0.4],
+			AP.M_DARK: [Color(0.07, 0.072, 0.08), 0.7, 0.0, 0.0, 0.0, 0.2, 0.4],
+			AP.M_ORANGE: [Color(0.82, 0.05, 0.03), 0.4, 0.0, 0.0, 0.35, 0.15, 0.3],
+			AP.M_METAL: [Color(0.36, 0.37, 0.4), 0.32, 0.75, 0.0, 0.0, 0.1, 0.3],
+		}
+	var rs: Array = TEAM_RIM_SPEC.get(pal, [])
+	var out := {}
+	for si in base.get_surface_count():
+		var src := base.surface_get_material(si) as ShaderMaterial
+		if src == null or src.shader == null:
+			continue
+		var m := ShaderMaterial.new()
+		m.shader = src.shader
+		for nm in _PAL_PARAMS:
+			var v = src.get_shader_parameter(nm)
+			if v != null:
+				m.set_shader_parameter(nm, v)
+		if spec.has(si):
+			var p: Array = spec[si]
+			for j in _PAL_SPEC_KEYS.size():
+				m.set_shader_parameter(_PAL_SPEC_KEYS[j], p[j])
+		if pal == PAL_ENEMY:
+			if si == AP.M_ORANGE:
+				m.set_shader_parameter("accent", ENEMY_ACCENT)
+			elif si == AP.M_VISOR:
+				m.set_shader_parameter("tint", ENEMY_VISOR_TINT)
+				m.set_shader_parameter("glow", ENEMY_VISOR_GLOW)
+			elif si == AP.M_GLOW:
+				m.set_shader_parameter("recolor", Color(ENEMY_LIGHT, 0.85))
+		if rim and not rs.is_empty() and si != AP.M_VISOR and si != AP.M_GLOW:
+			m.set_shader_parameter("team_rim", rs[0])
+			m.set_shader_parameter("team_rim_k", rs[1])
+			m.set_shader_parameter("team_rim_fill", rs[2])
+			m.set_shader_parameter("team_rim_near", TEAM_RIM_NEAR)
+			m.set_shader_parameter("team_rim_far", TEAM_RIM_FAR)
+		out[si] = m
+	_pal_mats[key] = out
+	return out
+
+
 # ------------------------------------------------------------------------------------------
 # Animation
 # ------------------------------------------------------------------------------------------
@@ -660,6 +1354,11 @@ func animate(delta: float, s: Dictionary) -> void:
 	var pitch: float = s.get("pitch", 0.0)
 	var holding: bool = s.get("holding", false)
 	var k := 1.0 - exp(-10.0 * delta)
+	# Crouch (knees bent, hips low, leaning in) and slide (hips on the ground, leaning back, one leg
+	# out in front, the other tucked): keys "crouch" / "slide" 0..1 (player.gd, remote avatars).
+	_crouch = lerpf(_crouch, clampf(float(s.get("crouch", 0.0)), 0.0, 1.0), 1.0 - exp(-12.0 * delta))
+	_slide = lerpf(_slide, clampf(float(s.get("slide", 0.0)), 0.0, 1.0), 1.0 - exp(-14.0 * delta))
+	var crouch_w := _crouch * (1.0 - _slide)
 
 	# --- State blends --------------------------------------------------------------------
 	var acc := (vloc - _vloc) / dt
@@ -707,20 +1406,30 @@ func animate(delta: float, s: Dictionary) -> void:
 	# --- Pelvis: double bob per stride, sway over the stance foot, twist, hip drop, lean -----
 	var bob_walk := -0.03 * (0.5 + 0.5 * cos(2.0 * ph))
 	var bob_run := -0.035 * (0.5 - 0.5 * cos(2.0 * ph)) + 0.02
-	var bob := lerpf(bob_walk, bob_run, _run) * gait
-	var sway := -0.022 * sin(ph) * gait * (1.0 - _run * 0.6)
-	sway += sin(_t * 0.45) * 0.018 * idle * _ground                 # idle weight shift
-	var twist := 0.11 * cos(ph) * gait
-	var drop := 0.045 * sin(ph) * gait + sin(_t * 0.45) * 0.03 * idle * _ground
+	var still := 1.0 - _slide                                       # no stepping motion in a slide
+	var bob := lerpf(bob_walk, bob_run, _run) * gait * still
+	var sway := -0.022 * sin(ph) * gait * (1.0 - _run * 0.6) * still
+	sway += sin(_t * 0.45) * 0.018 * idle * _ground * still          # idle weight shift
+	var twist := 0.11 * cos(ph) * gait * still
+	var drop := (0.045 * sin(ph) * gait + sin(_t * 0.45) * 0.03 * idle * _ground) * still
 	var lean := -(0.04 + 0.2 * _run) * gait - clampf(-_acc.z * 0.025, -0.18, 0.2) * _ground
 	lean -= 0.12 * jet_air * clampf(speed / 3.0, 0.0, 1.0)
+	# Crouch / slide pose numbers are matched to the camera of stance.gd (EYE_CROUCH / EYE_SLIDE): the
+	# neck ends up at the eye, so the first-person body view lines up with no torso around the camera.
+	lean -= 0.22 * crouch_w * _ground
+	lean = lerpf(lean, 0.7, _slide)                                 # slide: reclined, sitting low
 	var roll_turn := clampf(float(s.get("yaw_rate", 0.0)) * _speed * 0.03, -0.18, 0.18) * _ground
 	var squash := 0.13 * _land * _land
 	var low := minf(minf(_foot_off[0], _foot_off[1]), 0.0)
 	var hy := _hips_y + bob + breathe * 0.003 - squash + low * _ground
 	hy -= 0.05 * _air * (1.0 - _float)
-	hips.position = Vector3(sway, hy, 0.0)
-	var hips_rot := Vector3(lean, twist, drop + roll_turn)
+	hy -= 0.46 * crouch_w * _ground
+	hy = lerpf(hy, 0.26 + low * _ground, _slide)
+	_bl_pre(delta, s)                    # body language: timers, the wounded limp (end of file)
+	if _hr_on:
+		_hit_pelvis(stance, gait)        # hit reaction: buckle / limp / fold / stagger lean, before the leg IK
+	hips.position = Vector3(sway, hy, 0.0) + _hp_off * _ground
+	var hips_rot := Vector3(lean, twist, drop + roll_turn) + _hp_rot * _ground
 	hips.rotation = hips_rot
 
 	# --- Foot targets (root space, feet plane y = 0) + ground probes -----------------------
@@ -747,6 +1456,9 @@ func animate(delta: float, s: Dictionary) -> void:
 			fp = lerpf(-0.6, 0.25, smoothstep(0.0, 0.8, u2))
 		var base := Vector3(side * (0.11 + 0.008 * idle), 0.0, 0.0)
 		var t: Vector3 = base + _mdir * off * gait
+		# Crouched: one foot forward, the other back, a little wider (a stable stance).
+		t += Vector3(side * 0.04, 0.0, -0.13 if i == 1 else 0.1) * crouch_w * idle
+		t.z += 0.32 * float(_buckle_s[i])      # a buckled leg: the foot back, the knee down (hit reaction)
 		t.y = ANKLE_H + h * gait + _foot_off[i] * _ground
 		targets[i] = t
 		foot_pitch[i] = fp * gait
@@ -767,6 +1479,15 @@ func animate(delta: float, s: Dictionary) -> void:
 		tgt[thigh[i]] = pl.lerp(ik[0], _ground)
 		tgt[shin[i]] = air_sh.lerp(ik[1], _ground)
 		tgt[foot[i]] = air_ft.lerp(ik[2], _ground)
+		if _slide > 0.001:
+			# Slide (leg IK on the ground, so the feet stay on it): the right leg out in front, nearly
+			# straight on its heel with the toes up; the left one bent, knee up, foot flat beside it.
+			var s_t := Vector3(0.1, ANKLE_H, -0.74) if i == 1 else Vector3(-0.13, ANKLE_H, -0.36)
+			s_t.y += _foot_off[i] * _ground
+			var s_ik := _leg_ik(i, s_t, hips_rot, 0.55 if i == 1 else 0.0)
+			tgt[thigh[i]] = (tgt[thigh[i]] as Vector3).lerp(s_ik[0], _slide)
+			tgt[shin[i]] = (tgt[shin[i]] as Vector3).lerp(s_ik[1], _slide)
+			tgt[foot[i]] = (tgt[foot[i]] as Vector3).lerp(s_ik[2], _slide)
 
 	# --- Arms: counter-swing with the legs, elbows bend more when running ------------------
 	var swing := lerpf(0.3, 0.62, _run) * gait
@@ -833,6 +1554,11 @@ func animate(delta: float, s: Dictionary) -> void:
 			-(twist + chest_yaw) * 0.9 + 0.34 * blade + _look.x,
 			-(drop + roll_turn) * 0.6 + sin(_t * 0.3) * 0.03 * idle - 0.08 * blade)
 
+	if _slide > 0.001:
+		# Sliding: curl a little forward over the legs (the pelvis is reclined).
+		tgt[spine] = (tgt[spine] as Vector3) + Vector3(-0.1 * _slide, 0.0, 0.0)
+		tgt[chest] = (tgt[chest] as Vector3) + Vector3(-0.05 * _slide, 0.0, 0.0)
+
 	for b in tgt:
 		if b == hips:
 			continue
@@ -840,11 +1566,21 @@ func animate(delta: float, s: Dictionary) -> void:
 		_rot[b] = (_rot.get(b, Vector3.ZERO) as Vector3).lerp(tgt[b], 1.0 - exp(-r * delta))
 		b.rotation = _rot[b]
 
+	# Hit reaction: additive on top of the pose (not kept in _rot): torso / head snap, per-bone hit
+	# springs, gut fold, leg buckle / limp, stagger lean (the "Hit reaction" section); arms below.
+	if _hr_on:
+		_step_hit(delta)
+		_hit_body_pose(gait, stance)
+	_bl_body(delta)                      # body language: hunch, head look, a gesture's torso (end of file)
+
 	# --- Holding an item: arm IK on top of the swing (two-handed at the shoulder) ----------
 	if aim_w > 0.002:
 		_hold_ik(aim_w, aim_p)
 	_set_grip(1, 1.0 if _held != "" else 0.0)       # the fist closes around whatever is shown
 	_set_grip(0, blade)
+	if _hr_on:
+		_hit_arms_pose()
+	_bl_arms()                           # body language: a gesture's arm, the wounded hand (end of file)
 
 	# Swimming forward tips the whole body toward horizontal (pivot at the body center).
 	# Weightless flight: the head points along the velocity, banking into turns.
@@ -1026,7 +1762,7 @@ func _probe_ground(targets: Array, exclude: Array, delta: float) -> void:
 
 ## Helmet lamp lens glows when the headlamp is on (k = current brightness 0..1).
 func set_lamp(on: bool, k: float) -> void:
-	_lamp_mat.emission_energy_multiplier = 9.0 * k if on else 0.25
+	_lamp_mat.emission_energy_multiplier = 9.0 * k if on else _lamp_idle
 
 
 ## Flame / spark particle jet under a backpack nozzle.
@@ -1074,3 +1810,369 @@ func _make_jet_particles(parent: Node3D, pos: Vector3) -> GPUParticles3D:
 	p.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	parent.add_child(p)
 	return p
+
+
+# ------------------------------------------------------------------------------------------
+# Body language (2026-10-06, "NPC tepkileri": scripts/war/ai_rival.gd "Reactions and body language"
+# drives it on the host's bots, scripts/net/net_bot.gd on a client's puppets)
+# ------------------------------------------------------------------------------------------
+# Additive layers on top of the animated pose, like the hit reaction (never kept in _rot), blended in
+# and out. Hooks in animate (one line each): _bl_pre before the hit pelvis (timers; the wounded limp
+# through the hit reaction's _limp), _bl_body after the torso / head targets and the hit pose but
+# before the hold IK (hunch, head look, a gesture's torso: the held item follows the chest), _bl_arms
+# after the hold IK and the hit arms (a gesture's arm: the LEFT one leaves the gun's front, the right
+# keeps the grip). apply_hit -> _bl_hit (a hard hit cuts a gesture short); reset_pose -> _bl_clear.
+# Weighted down while sliding, airborne, staggered or doubled over.
+#   gesture(kind, dir_local := FORWARD, dur := -1)   a one-shot (dur < 0: its own length); dir_local is
+#                     in this node's space (-Z ahead, the way it points / looks). Kinds:
+#                     "startle"  a jolt back, shoulders up, the head snapping toward dir (0.45 s)
+#                     "point"    the left arm points along dir, a knife hand, the head looks along
+#                     "advance"  "move up": the arm chops forward twice toward dir
+#                     "hold"     "hold": a fist raised beside the helmet
+#                     "cover_me" a hand patting the top of the helmet (before a reload under fire)
+#                     "wave" · "thumbs_up" · "nod" · "ack" (a nod and a raised palm) · "fist" (a short
+#                     pump, after a kill) · "cower" (hunched, a forearm over the visor, head away from dir)
+#                     "glance" (only the head, toward dir) · idle: "look_around" "stretch" "check_rifle"
+#                     "wipe_visor" "rest" (bent over, a hand on the knee) "inspect" (a hand on a panel
+#                     at dir) "scan" (the chest and the held tool sweep side to side)
+#   queue_gesture(kind, dir_local, dur)   plays after the current one (e.g. startle -> point)
+#   look_dir(dir_local, hold)             the head (a little of the chest) turns that way for hold s
+#   set_mood(wound, hunch)                0..1: wounded (limp, a hand pressed to the left side when the
+#                                         hands are free), hunched (under heavy fire)
+#   gesture_kind() -> String              the one playing ("" none)
+
+const BL_DUR := {"startle": 0.45, "point": 1.35, "advance": 1.15, "hold": 1.2, "cover_me": 1.0, "wave": 1.6,
+		"thumbs_up": 1.4, "nod": 0.9, "ack": 1.0, "fist": 1.0, "cower": 1.3, "glance": 1.4, "look_around": 3.2,
+		"stretch": 2.4, "check_rifle": 2.2, "wipe_visor": 1.5, "rest": 5.0, "inspect": 3.2, "scan": 3.0}
+const BL_LEFT_ARM := ["point", "advance", "hold", "cover_me", "wave", "thumbs_up", "ack", "fist", "cower",
+		"stretch", "wipe_visor", "rest", "inspect"]
+
+var _bl_g := ""
+var _bl_gt := 0.0
+var _bl_gdur := 1.0
+var _bl_gdir := Vector3.FORWARD
+var _bl_queue: Array = []              # [kind, dir, dur]
+var _bl_look := Vector3.FORWARD
+var _bl_look_w := 0.0
+var _bl_look_t := 0.0
+var _bl_wound := 0.0
+var _bl_wound_to := 0.0
+var _bl_hunch := 0.0
+var _bl_hunch_to := 0.0
+var _bl_using := false
+var _bl_on := false
+
+
+func gesture(kind: String, dir_local := Vector3.FORWARD, dur := -1.0) -> void:
+	if not BL_DUR.has(kind):
+		return
+	_bl_queue.clear()
+	_bl_start(kind, dir_local, dur)
+
+
+func queue_gesture(kind: String, dir_local := Vector3.FORWARD, dur := -1.0) -> void:
+	if not BL_DUR.has(kind):
+		return
+	if _bl_g == "":
+		_bl_start(kind, dir_local, dur)
+	else:
+		_bl_queue.append([kind, dir_local, dur])
+
+
+func look_dir(dir_local: Vector3, hold: float) -> void:
+	if dir_local.length_squared() < 1e-4:
+		return
+	_bl_look = dir_local.normalized()
+	_bl_look_t = maxf(_bl_look_t, hold)
+	_bl_on = true
+
+
+func set_mood(wound: float, hunch: float) -> void:
+	_bl_wound_to = clampf(wound, 0.0, 1.0)
+	_bl_hunch_to = clampf(hunch, 0.0, 1.0)
+	if _bl_wound_to > 0.0 or _bl_hunch_to > 0.0:
+		_bl_on = true
+
+
+func gesture_kind() -> String:
+	return _bl_g
+
+
+func _bl_start(kind: String, dir_local: Vector3, dur: float) -> void:
+	_bl_g = kind
+	_bl_gt = 0.0
+	_bl_gdur = dur if dur > 0.0 else float(BL_DUR[kind])
+	_bl_gdir = dir_local.normalized() if dir_local.length_squared() > 1e-4 else Vector3.FORWARD
+	_bl_on = true
+
+
+func _bl_clear() -> void:
+	_bl_g = ""
+	_bl_queue.clear()
+	_bl_look_w = 0.0
+	_bl_look_t = 0.0
+	_bl_wound = 0.0
+	_bl_hunch = 0.0
+
+
+## A hit lands: a hard one cuts the gesture short (not a cower: that is the reaction).
+func _bl_hit(k: float) -> void:
+	if _bl_g != "" and _bl_g != "cower" and k > 0.3:
+		_bl_gdur = minf(_bl_gdur, _bl_gt + 0.2)
+		_bl_queue.clear()
+
+
+## The envelope of the gesture playing: in over 0.18 s, out over the last 0.3 s.
+func _bl_env() -> float:
+	if _bl_g == "":
+		return 0.0
+	var e := smoothstep(0.0, 0.18, _bl_gt) * (1.0 - smoothstep(_bl_gdur - 0.3, _bl_gdur, _bl_gt))
+	return e * _ground * (1.0 - _slide) * (1.0 - _stg) * (1.0 - _fold_s)
+
+
+func _bl_pre(delta: float, s: Dictionary) -> void:
+	if not _bl_on:
+		return
+	_bl_using = bool(s.get("using", false))
+	_bl_wound = lerpf(_bl_wound, _bl_wound_to, 1.0 - exp(-3.0 * delta))
+	_bl_hunch = lerpf(_bl_hunch, _bl_hunch_to, 1.0 - exp(-6.0 * delta))
+	if _bl_g != "":
+		_bl_gt += delta
+		if _bl_gt >= _bl_gdur:
+			_bl_g = ""
+			if not _bl_queue.is_empty():
+				var q: Array = _bl_queue.pop_front()
+				_bl_start(q[0], q[1], q[2])
+	_bl_look_t -= delta
+	_bl_look_w = move_toward(_bl_look_w, 1.0 if _bl_look_t > 0.0 else 0.0, delta * (4.0 if _bl_look_t > 0.0 else 1.8))
+	if _bl_wound > 0.02:
+		# Wounded: the left leg limps (the hit reaction's limp: the pelvis dips over it, the reactor
+		# slows the walk by limp_amount()).
+		_limp[0] = maxf(float(_limp[0]), 0.75 * _bl_wound)
+		_hr_on = true
+	_bl_on = _bl_g != "" or _bl_look_w > 0.001 or _bl_wound > 0.005 or _bl_hunch > 0.005 \
+			or _bl_wound_to > 0.0 or _bl_hunch_to > 0.0
+
+
+## Yaw / pitch (root space, -Z ahead) of a direction, clamped to what a neck and a chest turn give.
+static func _bl_yp(d: Vector3) -> Vector2:
+	return Vector2(clampf(atan2(-d.x, -d.z), -1.4, 1.4), clampf(asin(clampf(d.y, -1.0, 1.0)), -0.7, 0.6))
+
+
+func _bl_body(_delta: float) -> void:
+	if not _bl_on:
+		return
+	var e := _bl_env()
+	var u := _bl_gt / maxf(_bl_gdur, 0.01)
+	var g := _bl_g
+	# Hunch: heavy fire, a wound (a little), cowering.
+	var hunch := maxf(_bl_hunch * 0.85, _bl_wound * 0.3)
+	if g == "cower":
+		hunch = maxf(hunch, e)
+	if hunch > 0.001:
+		spine.rotation.x -= 0.5 * hunch
+		chest.rotation.x -= 0.3 * hunch
+		head.rotation.x += 0.5 * hunch
+	var tw := _bl_twist() * e
+	if tw > 0.001:
+		# A pointing / signalling arm toward its right: the torso turns with it (the left arm cannot
+		# reach across the chest).
+		spine.rotation.y -= tw * 0.4
+		chest.rotation.y -= tw * 0.6
+	if _bl_wound > 0.01:
+		spine.rotation.z += 0.07 * _bl_wound           # leaning over the hurt (left) side
+	# Where the head looks: the look order, else the gesture's own.
+	var lw := _bl_look_w
+	var ld := _bl_look
+	match g:
+		"startle":
+			var snap := clampf(_bl_gt / 0.1, 0.0, 1.0)
+			if snap * e > lw:
+				lw = snap * e
+				ld = _bl_gdir
+			var jerk := sin(clampf(_bl_gt / 0.42, 0.0, 1.0) * PI)
+			spine.rotation.x += 0.16 * jerk
+			chest.rotation.x += 0.06 * jerk
+		"point", "advance", "glance", "inspect", "thumbs_up", "fist":
+			if e > lw:
+				lw = e
+				ld = _bl_gdir
+		"cower":
+			var away := Vector3(_bl_gdir.x, 0.0, _bl_gdir.z)
+			if away.length_squared() > 1e-4:
+				var yp := _bl_yp(-away.normalized())
+				head.rotation.y += clampf(yp.x, -0.5, 0.5) * 0.6 * e
+			head.rotation.x -= 0.25 * e
+		"look_around":
+			var a := sin(u * TAU) * 1.05
+			var dd := Vector3(-sin(a), -0.05, -cos(a))
+			if e > lw:
+				lw = e
+				ld = dd
+		"scan":
+			var sw := sin(u * TAU * 1.5) * 0.5 * e
+			chest.rotation.y += sw * 0.6
+			spine.rotation.y += sw * 0.3
+			head.rotation.y += sw * 0.4
+		"stretch":
+			spine.rotation.x += 0.12 * e
+			chest.rotation.z -= 0.12 * e * sin(clampf(u * 1.2, 0.0, 1.0) * PI)
+			head.rotation.x += 0.2 * e
+		"check_rifle":
+			head.rotation.x -= 0.5 * e
+			head.rotation.y -= 0.3 * e
+			chest.rotation.x -= 0.08 * e
+		"rest":
+			spine.rotation.x -= 0.42 * e
+			chest.rotation.x -= 0.22 * e
+			head.rotation.x -= 0.05 * e
+		"nod", "ack":
+			head.rotation.x -= 0.24 * maxf(0.0, sin(_bl_gt * 11.0)) * e
+		"wipe_visor":
+			head.rotation.x -= 0.1 * e
+	if lw > 0.001:
+		var yp2 := _bl_yp(ld)
+		chest.rotation.y += yp2.x * 0.3 * lw
+		head.rotation.y += yp2.x * 0.7 * lw
+		head.rotation.x += yp2.y * 0.8 * lw
+
+
+## The hand basis (root space) for fingers along f, the grip axis (hand Z) toward zhint.
+static func _bl_hb(f: Vector3, zhint: Vector3) -> Basis:
+	var y := -f.normalized()
+	var z := zhint - y * zhint.dot(y)
+	if z.length_squared() < 1e-4:
+		z = Vector3.RIGHT - y * y.x
+	z = z.normalized()
+	return Basis(y.cross(z).normalized(), y, z)
+
+
+## How far the torso turns right for a directed left-arm gesture at a target on its right (rad).
+func _bl_twist() -> float:
+	if not (_bl_g in ["point", "advance"]):
+		return 0.0
+	return clampf(atan2(_bl_gdir.x, -_bl_gdir.z) - 0.25, 0.0, 0.8)
+
+
+## d with its heading (root space, + = right) at most `hi` rad right of ahead (the left arm's reach).
+static func _bl_clamp_yaw(d: Vector3, hi: float) -> Vector3:
+	var l := Vector2(d.x, d.z).length()
+	if l < 1e-4 or atan2(d.x, -d.z) <= hi:
+		return d
+	return Vector3(sin(hi) * l, d.y, -cos(hi) * l).normalized()
+
+
+func _bl_arms() -> void:
+	if not _bl_on:
+		return
+	var e := _bl_env()
+	var g := _bl_g
+	var cx := _chest_xf()
+	var S: Vector3 = cx * (shoulder[0] as Node3D).position
+	if g == "startle":
+		var jerk := sin(clampf(_bl_gt / 0.42, 0.0, 1.0) * PI) * e
+		for i in 2:
+			_add_rotvec(shoulder[i], Vector3(0.0, 0.0, (-1.0 if i == 0 else 1.0) * 0.18 * jerk))
+		return
+	if g == "check_rifle":
+		# The rifle rolled over in the right hand to look at its side, twice.
+		var roll := sin(_bl_gt / _bl_gdur * TAU * 2.0) * 0.85 * e
+		_add_rotvec(hand[1], Vector3(0.0, roll, 0.0))
+		_add_rotvec(elbow[1], Vector3(0.4 * e, 0.0, 0.0))
+		_add_rotvec(shoulder[1], Vector3(-0.15 * e, 0.0, 0.0))
+	var reach := (AP.L_UPPER + AP.L_FORE) * 0.95
+	var w := 0.0
+	var wrist := Vector3.ZERO
+	var hb := Basis()
+	var pole := Vector3(-0.4, -0.9, 0.15)
+	var grip := -1.0
+	if g in BL_LEFT_ARM and e > 0.002:
+		w = e
+		var u := _bl_gt / maxf(_bl_gdur, 0.01)
+		var d := _bl_clamp_yaw(_bl_gdir, 0.3 + _bl_twist())
+		var dh := Vector3(d.x, 0.0, d.z)
+		dh = dh.normalized() if dh.length_squared() > 1e-4 else Vector3.FORWARD
+		var hx: Transform3D = cx * (head as Node3D).transform
+		var face: Vector3 = hx * Vector3(0.0, 0.2, -0.24)
+		match g:
+			"point":
+				var jab := 0.86 + 0.14 * smoothstep(0.12, 0.32, _bl_gt)
+				var dd := (d + Vector3.UP * 0.06).normalized()
+				wrist = S + dd * reach * jab
+				hb = _bl_hb(dd, Vector3.DOWN)
+				grip = 0.0
+			"advance":
+				var a := 0.5 + 0.5 * cos(clampf((u - 0.15) / 0.75, 0.0, 1.0) * TAU * 2.0)
+				var ad := (dh * 0.9 + Vector3.UP * (0.02 + 0.42 * a)).normalized()
+				wrist = S + ad * reach
+				hb = _bl_hb(ad, Vector3.DOWN)
+				grip = 0.0
+			"hold":
+				wrist = S + Vector3(-0.2, 0.33, -0.1)
+				hb = _bl_hb(Vector3.UP, Vector3.FORWARD)
+				pole = Vector3(-1.0, -0.3, 0.1)
+				grip = 1.0
+			"cover_me":
+				var top: Vector3 = hx * Vector3(0.0, 0.37, 0.0)
+				wrist = top + Vector3(-0.04, 0.05 + 0.045 * absf(sin(_bl_gt * 11.0)), 0.08)
+				hb = _bl_hb(Vector3(0.15, -0.25, -1.0), Vector3.RIGHT)
+				pole = Vector3(-0.9, 0.3, -0.3)
+				grip = 0.0
+			"wave":
+				wrist = S + Vector3(-0.14 + 0.09 * sin(_bl_gt * 9.0), 0.47, -0.1)
+				hb = _bl_hb(Vector3(0.12 * sin(_bl_gt * 9.0), 1.0, 0.0), Vector3.RIGHT)
+				pole = Vector3(-1.0, -0.3, 0.2)
+				grip = 0.0
+			"thumbs_up":
+				# The hand raised toward him at shoulder height, thumb up, a small approving jab.
+				var jab2 := 0.05 * sin(clampf((_bl_gt - 0.3) / 0.35, 0.0, 1.0) * PI)
+				wrist = S + dh * (0.36 + jab2) + Vector3(0.0, 0.1 + jab2, 0.0)
+				hb = _bl_hb((Vector3.UP * 0.9 + dh * 0.25).normalized(), Vector3.RIGHT)
+				pole = Vector3(-0.7, -0.7, 0.1)
+				grip = 0.0
+			"fist":
+				var pump := smoothstep(0.25, 0.42, u) * (1.0 - smoothstep(0.55, 0.8, u))
+				wrist = S + Vector3(0.04, 0.2 - 0.3 * pump, -0.3)
+				hb = _bl_hb(Vector3(0.1, 0.6, -0.8), Vector3.DOWN)
+				grip = 1.0
+			"ack":
+				wrist = S + Vector3(-0.06, 0.22, -0.24)
+				hb = _bl_hb(Vector3.UP, Vector3.RIGHT)
+				grip = 0.0
+			"cower":
+				wrist = face + Vector3(0.02, 0.1, -0.12)
+				hb = _bl_hb(Vector3(1.0, 0.2, 0.0), Vector3.DOWN)
+				pole = Vector3(-0.8, -0.5, -0.3)
+				grip = 0.0
+			"wipe_visor":
+				var sweep := smoothstep(0.15, 0.85, u)
+				wrist = face + Vector3(lerpf(-0.14, 0.1, sweep), -0.06, -0.06)
+				hb = _bl_hb(Vector3.UP, Vector3.RIGHT)
+				pole = Vector3(-0.8, -0.6, -0.2)
+				grip = 0.0
+			"stretch":
+				wrist = S + Vector3(0.06, 0.52, 0.04)
+				hb = _bl_hb(Vector3.UP, Vector3.FORWARD)
+				pole = Vector3(-0.8, 0.2, 0.2)
+				grip = 0.0
+			"rest":
+				var knee: Vector3 = hips.transform * ((thigh[0] as Node3D).transform * (shin[0] as Node3D).position)
+				wrist = knee + Vector3(0.0, 0.13, -0.04)
+				hb = _bl_hb(Vector3(0.0, -1.0, -0.4), Vector3.RIGHT)
+				pole = Vector3(-0.5, 0.2, 0.8)
+				grip = 0.0
+			"inspect":
+				wrist = S + dh * 0.46 + Vector3(0.0, -0.1, 0.0)
+				hb = _bl_hb((Vector3.UP * 0.8 + dh * 0.2).normalized(), Vector3.RIGHT)
+				grip = 0.0
+	elif _bl_wound > 0.05 and not _bl_using and _ground > 0.5:
+		# Wounded: the left hand pressed to the side (the gun hangs in the right).
+		w = _bl_wound * 0.85 * (1.0 - _slide)
+		wrist = cx * Vector3(-0.2, -0.05, -0.17)
+		hb = _bl_hb(Vector3(0.8, -0.5, 0.2), Vector3.FORWARD)
+		pole = Vector3(-0.8, -0.5, 0.3)
+		grip = 0.0
+	if w > 0.002:
+		_arm_ik(0, wrist, hb, pole, clampf(w, 0.0, 1.0))
+		if grip >= 0.0 and w > 0.5:
+			_set_grip(0, grip)

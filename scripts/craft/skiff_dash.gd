@@ -2,13 +2,28 @@ extends Control
 ## The Mekik's instrument screen (skiff.gd): drawn into a small SubViewport whose texture lights the
 ## pilot's display on the dash (diegetic, no 2D overlay). Turkish labels.
 ##   left    HIZ (speed), DİKEY (vertical speed), İTKİ / TAKVİYE bars
-##   centre  attitude ball (pitch ladder, bank), the mode line under it
+##   centre  RADAR (default; R in the pilot seat cycles 400 m › 150 m › UFUK) or the attitude ball
+##           (pitch ladder, bank); the mode line under it
 ##   right   İRTİFA (height of the feet above the ground), distance to the YURT / RAKİP surfaces,
 ##           GÖVDE (hull) bar
 ## Skiff.gd fills `data` and calls refresh() ~20 times a second while the ship is powered.
+## Radar (radar_scan, filled by skiff.gd into data["radar"]): top-down on the local horizontal plane,
+## the ship's heading up, the ship in the middle. Both planets as discs (their projection: the one
+## under us fills the scope) labelled YURT / RAKİP, the cores (diamonds; out of range: on the rim with
+## a tick toward them), our structures (cyan squares) and theirs (red), skiffs (triangles along their
+## heading: ours cyan, enemy red), enemy drop pods in flight (red, ringed), incoming shells / torpedoes
+## (blinking), the other player (co-op green, PvP red), carriers (groups "war_carrier" / "respawn_ship",
+## big hexagons). A carat over / under a far-above / below contact. Built only from replicated nodes
+## and groups, so a client's dash shows the same.
 
 const UI := preload("res://scripts/ui/ui_style.gd")
+const Bodies := preload("res://scripts/planet/bodies.gd")
 const SIZE := Vector2i(768, 384)
+const RADAR_C := Vector2(384.0, 158.0)
+const RADAR_R := 116.0
+const RADAR_RANGES := [400.0, 150.0]       # m (skiff.gd radar_mode 0, 1; 2 = the attitude ball)
+const HOME_COL := Color(0.42, 0.85, 1.0)
+const ENEMY_COL := Color(1.0, 0.36, 0.3)
 
 const BG := Color(0.035, 0.06, 0.085)
 const LINE := Color(0.35, 0.62, 0.78, 0.35)
@@ -100,10 +115,23 @@ func _left(_w: float, h: float) -> void:
 	var bo: float = clampf(float(data.get("boost", 0.0)), 0.0, 1.0)
 	_bar(Vector2(26, 252), 200.0, thr, CYAN, "İTKİ")
 	_bar(Vector2(26, 300), 200.0, bo, AMBER, "TAKVİYE")
-	_text(Vector2(26, h - 30), "MEKİK · YR-01", 15, Color(DIM, 0.6), _f)
+	if data.has("heat"):
+		# Armed variant (armed_skiff.gd): the gun's heat instead of the name plate.
+		var heat: float = clampf(float(data.get("heat", 0.0)), 0.0, 1.0)
+		var over: bool = bool(data.get("overheat", false))
+		var hc := GREEN.lerp(AMBER, smoothstep(0.45, 0.7, heat)).lerp(RED, smoothstep(0.75, 0.95, heat))
+		if over:
+			hc = RED if fmod(_t, 0.5) < 0.3 else Color(RED, 0.45)
+		_bar(Vector2(26, h - 36), 200.0, heat, hc, "AŞIRI ISINDI" if over else "TOP ISISI")
+	else:
+		_text(Vector2(26, h - 30), str(data.get("reg", "MEKİK · YR-01")), 15, Color(DIM, 0.6), _f)
 
 
 func _center(w: float, h: float) -> void:
+	if data.get("radar") is Dictionary:
+		_radar(data["radar"])
+		_mode_lines(w)
+		return
 	var c := Vector2(w * 0.5, 160.0)
 	var r := 108.0
 	var pitch: float = float(data.get("pitch", 0.0))
@@ -138,7 +166,13 @@ func _center(w: float, h: float) -> void:
 	draw_line(c + Vector2(-14, 0), c + Vector2(0, 10), AMBER, 4.0)
 	draw_line(c + Vector2(14, 0), c + Vector2(0, 10), AMBER, 4.0)
 	draw_circle(c, 3.0, AMBER)
-	# Mode line.
+	_text(Vector2(c.x + r - 4.0, c.y - r + 8.0), "UFUK", 14, Color(DIM, 0.8), _fb, HORIZONTAL_ALIGNMENT_RIGHT)
+	_text(Vector2(c.x + r - 4.0, c.y - r + 24.0), "R", 13, Color(DIM, 0.55), _f, HORIZONTAL_ALIGNMENT_RIGHT)
+	_mode_lines(w)
+
+
+## Mode line, its sub line and the master warning under the centre instrument.
+func _mode_lines(w: float) -> void:
 	var mode: String = str(data.get("mode", ""))
 	var mc: Color = data.get("mode_color", CYAN)
 	_text(Vector2(w * 0.5, 304), mode, 24, mc, _fb, HORIZONTAL_ALIGNMENT_CENTER)
@@ -183,7 +217,201 @@ func _right(w: float, h: float) -> void:
 	draw_rect(Rect2(x, 304, w - 26 - x, 12), Color(1, 1, 1, 0.08))
 	draw_rect(Rect2(x, 304, (w - 26 - x) * hp, 12), hc)
 	var lights: bool = bool(data.get("lights", false))
-	_text(Vector2(x, h - 30), "IŞIK " + ("AÇIK" if lights else "KAPALI") + "  ·  L", 15, Color(DIM, 0.7), _f)
+	if data.has("rockets"):
+		# Armed variant: rockets in the pods, or the reload progress.
+		var n: int = int(data.get("rockets", 0))
+		var rl: float = float(data.get("rocket_reload", 0.0))
+		var rt := ("ROKET  %d / 4" % n) if rl <= 0.0 else ("ROKET  %%%d" % roundi(rl * 100.0))
+		_text(Vector2(x, h - 30), rt, 16, AMBER if rl > 0.0 else TXT, _fb)
+		for i in 4:
+			var lit := i < n
+			draw_rect(Rect2(Vector2(w - 26 - 14.0 * float(4 - i), h - 44), Vector2(10, 16)), Color(AMBER, 0.9) if lit else Color(1, 1, 1, 0.1))
+	else:
+		_text(Vector2(x, h - 30), "IŞIK " + ("AÇIK" if lights else "KAPALI") + "  ·  L", 15, Color(DIM, 0.7), _f)
+
+
+# =================================================================================================
+# Radar
+# =================================================================================================
+
+## The radar picture around `ship` (world -> its scope frame, metres): x right, y ahead along the
+## heading on the horizontal plane of `up`, h up. Called by skiff.gd while powered (~20 Hz).
+##   {"range", "planets": [[x, y, r, label, home]], "items": [[kind, x, y, h, col, ang]]}
+##   kind: "core" "struct" "skiff" "pod" "shell" "player" "carrier"; ang: heading on the scope (skiffs)
+static func radar_scan(ship: Node3D, up: Vector3, range_m: float) -> Dictionary:
+	var c := ship.global_position
+	var u := up.normalized() if up.length_squared() > 1e-6 else Vector3.UP
+	var b := ship.global_transform.basis.orthonormalized()
+	var f := -b.z - u * (-b.z).dot(u)
+	if f.length_squared() < 0.02:
+		# Nose straight up / down: the top of the ship points back / ahead.
+		f = (b.y - u * b.y.dot(u)) * -signf((-b.z).dot(u))
+	f = f.normalized() if f.length_squared() > 1e-6 else Vector3.FORWARD
+	var r := f.cross(u).normalized()
+	var planets: Array = []
+	for body in Bodies.all():
+		if body == null or not is_instance_valid(body):
+			continue
+		var rel: Vector3 = (body as Node3D).global_position - c
+		var home: bool = body == Game.planet
+		planets.append([rel.dot(r), rel.dot(f), float(body.get("radius")), "YURT" if home else "RAKİP", home])
+	var items: Array = []
+	var tree := ship.get_tree()
+	var far := range_m * 1.05
+	for n in tree.get_nodes_in_group("war_core"):
+		if n is Node3D and is_instance_valid(n) and n.get("destroyed") != true:
+			_radar_add(items, "core", (n as Node3D).global_position - c, r, f, u, _team_col(n), 0.0)
+	for n in tree.get_nodes_in_group("war_structure"):
+		if not (n is Node3D) or not is_instance_valid(n) or n == ship or n.is_in_group("skiff") \
+				or n.has_meta("build_preview") or n.get("is_destroyed") == true:
+			continue
+		var rel: Vector3 = (n as Node3D).global_position - c
+		if rel.length() < far * 1.5:
+			_radar_add(items, "struct", rel, r, f, u, _team_col(n), 0.0)
+	for n in tree.get_nodes_in_group("skiff"):
+		if not (n is Node3D) or not is_instance_valid(n) or n == ship or n.get("destroyed") == true:
+			continue
+		var sf: Vector3 = -(n as Node3D).global_transform.basis.z
+		_radar_add(items, "skiff", (n as Node3D).global_position - c, r, f, u, _team_col(n), atan2(sf.dot(r), sf.dot(f)))
+	for n in tree.get_nodes_in_group("war_drop_pod"):
+		if n is Node3D and is_instance_valid(n) and Game.team_of(n) != "home" and n.has_method("is_live") and n.is_live():
+			_radar_add(items, "pod", (n as Node3D).global_position - c, r, f, u, ENEMY_COL, 0.0)
+	for n in tree.get_nodes_in_group("war_shell"):
+		if not (n is Node3D) or not is_instance_valid(n) or n.is_in_group("war_drop_pod") or Game.team_of(n) == "home":
+			continue
+		if n.has_method("is_live") and not n.is_live():
+			continue
+		var rel: Vector3 = (n as Node3D).global_position - c
+		if rel.length() < far * 1.5:
+			_radar_add(items, "shell", rel, r, f, u, ENEMY_COL, 0.0)
+	for n in tree.get_nodes_in_group("net_player"):
+		if not (n is Node3D) or not is_instance_valid(n) or n.get("dead") == true:
+			continue
+		var rel: Vector3 = (n as Node3D).global_position - c
+		if rel.length() < 3.5:
+			continue                             # (in this ship with us)
+		var col: Color = Color(0.45, 0.95, 0.55) if Game.team_of(n) == "home" else ENEMY_COL
+		_radar_add(items, "player", rel, r, f, u, col, 0.0)
+	for g in ["war_carrier", "respawn_ship"]:
+		for n in tree.get_nodes_in_group(g):
+			if n is Node3D and is_instance_valid(n):
+				_radar_add(items, "carrier", (n as Node3D).global_position - c, r, f, u, _team_col(n), 0.0)
+	return {"range": range_m, "planets": planets, "items": items}
+
+
+static func _radar_add(items: Array, kind: String, rel: Vector3, r: Vector3, f: Vector3, u: Vector3, col: Color, ang: float) -> void:
+	items.append([kind, rel.dot(r), rel.dot(f), rel.dot(u), col, ang])
+
+
+static func _team_col(n: Node) -> Color:
+	return HOME_COL if Game.team_of(n) == "home" else ENEMY_COL
+
+
+func _radar(rd: Dictionary) -> void:
+	var c := RADAR_C
+	var rr := RADAR_R
+	var rng := maxf(float(rd.get("range", 400.0)), 1.0)
+	var k := rr / rng
+	var scope := _circle_poly(c, rr, 56)
+	draw_colored_polygon(scope, Color(0.02, 0.07, 0.07))
+	# Planets: their discs, clipped to the scope.
+	for p in rd.get("planets", []):
+		var pc: Vector2 = c + Vector2(float(p[0]), -float(p[1])) * k
+		var pr := float(p[2]) * k
+		var home: bool = bool(p[4])
+		var col := Color(0.25, 0.75, 0.45) if home else Color(0.95, 0.5, 0.25)
+		var dist := pc.distance_to(c)
+		if dist - pr > rr:
+			# Out of the scope: a tick on the rim toward it, the name inside.
+			var dir := (pc - c) / maxf(dist, 1e-3)
+			draw_line(c + dir * (rr - 10.0), c + dir * (rr + 2.0), col, 4.0)
+			_text(c + dir * (rr - 26.0) + Vector2(0, 5), str(p[3]), 13, col, _fb, HORIZONTAL_ALIGNMENT_CENTER)
+			continue
+		var disc := _circle_poly(pc, pr, 64)
+		for part in Geometry2D.intersect_polygons(disc, scope):
+			if (part as PackedVector2Array).size() >= 3:
+				draw_colored_polygon(part, Color(col, 0.16))
+		var prev := Vector2.INF
+		for i in 65:
+			var a := TAU * float(i) / 64.0
+			var q := pc + Vector2(cos(a), sin(a)) * pr
+			var inside := q.distance_to(c) <= rr
+			if inside and prev != Vector2.INF:
+				draw_line(prev, q, Color(col, 0.75), 2.0)
+			prev = q if inside else Vector2.INF
+		var lp := pc
+		if lp.distance_to(c) > rr - 18.0:
+			lp = c + (pc - c).normalized() * (rr - 30.0) if dist > 1.0 else c + Vector2(0, rr * 0.55)
+		elif pr > rr * 0.9:
+			lp = c + Vector2(0, rr * 0.62)    # (the one under us: its name low in the scope)
+		_text(lp + Vector2(0, 5), str(p[3]), 15, col, _fb, HORIZONTAL_ALIGNMENT_CENTER)
+	# Range rings and the heading line.
+	draw_arc(c, rr * 0.5, 0.0, TAU, 48, Color(LINE, 0.5), 1.0)
+	draw_line(c + Vector2(0, -rr), c + Vector2(0, rr), Color(LINE, 0.35), 1.0)
+	draw_line(c + Vector2(-rr, 0), c + Vector2(rr, 0), Color(LINE, 0.35), 1.0)
+	# Contacts.
+	var blink := fmod(_t, 0.5) < 0.3
+	for it in rd.get("items", []):
+		var kind: String = str(it[0])
+		var p := c + Vector2(float(it[1]), -float(it[2])) * k
+		var col: Color = it[4]
+		var out := p.distance_to(c) > rr - 4.0
+		if out:
+			if not (kind in ["core", "pod", "player", "carrier", "skiff"]):
+				continue
+			p = c + (p - c).normalized() * (rr - 4.0)
+		match kind:
+			"core":
+				var s := 8.0
+				var dia := PackedVector2Array([p + Vector2(0, -s), p + Vector2(s, 0), p + Vector2(0, s), p + Vector2(-s, 0)])
+				draw_colored_polygon(dia, Color(col, 0.35 if out else 0.85))
+				draw_polyline(dia + PackedVector2Array([dia[0]]), col, 2.0)
+			"struct":
+				draw_rect(Rect2(p - Vector2(3.5, 3.5), Vector2(7, 7)), col)
+			"skiff":
+				var a := float(it[5])
+				var fw := Vector2(sin(a), -cos(a))
+				var rt := Vector2(-fw.y, fw.x)
+				draw_colored_polygon(PackedVector2Array([p + fw * 9.0, p - fw * 6.0 + rt * 6.0, p - fw * 6.0 - rt * 6.0]),
+						Color(col, 0.5 if out else 1.0))
+			"pod":
+				draw_circle(p, 5.0, col)
+				if blink:
+					draw_arc(p, 9.0, 0.0, TAU, 16, col, 2.0)
+			"shell":
+				if blink:
+					draw_circle(p, 3.5, AMBER if fmod(_t, 1.0) < 0.5 else col)
+			"player":
+				draw_circle(p, 5.0, col)
+				draw_arc(p, 8.0, 0.0, TAU, 16, Color(col, 0.6), 1.5)
+			"carrier":
+				var hx := PackedVector2Array()
+				for i in 6:
+					var ha := TAU * float(i) / 6.0
+					hx.append(p + Vector2(cos(ha), sin(ha)) * 9.0)
+				draw_colored_polygon(hx, Color(col, 0.35))
+				hx.append(hx[0])
+				draw_polyline(hx, col, 2.0)
+		# Far above / below: a carat (a contact more than a quarter of the range up or down).
+		var hgt := float(it[3])
+		if kind != "struct" and kind != "core" and absf(hgt) > rng * 0.25:
+			var sg := -1.0 if hgt > 0.0 else 1.0
+			draw_colored_polygon(PackedVector2Array([p + Vector2(0, sg * 15.0), p + Vector2(-4, sg * 10.0), p + Vector2(4, sg * 10.0)]),
+					Color(col, 0.8))
+	# Our ship, the rim, the range.
+	draw_colored_polygon(PackedVector2Array([c + Vector2(0, -10), c + Vector2(7, 7), c + Vector2(0, 3), c + Vector2(-7, 7)]), AMBER)
+	draw_arc(c, rr, 0.0, TAU, 64, Color(LINE, 0.9), 3.0)
+	_text(Vector2(c.x + rr - 2.0, c.y - rr + 8.0), "%d m" % roundi(rng), 15, CYAN, _fb, HORIZONTAL_ALIGNMENT_RIGHT)
+	_text(Vector2(c.x + rr - 2.0, c.y - rr + 24.0), "R", 13, Color(DIM, 0.55), _f, HORIZONTAL_ALIGNMENT_RIGHT)
+	_text(Vector2(c.x - rr + 2.0, c.y - rr + 8.0), "RADAR", 14, Color(DIM, 0.8), _fb)
+
+
+static func _circle_poly(c: Vector2, r: float, n: int) -> PackedVector2Array:
+	var out := PackedVector2Array()
+	for i in n:
+		var a := TAU * float(i) / float(n)
+		out.append(c + Vector2(cos(a), sin(a)) * r)
+	return out
 
 
 func _bar(p: Vector2, w: float, k: float, col: Color, label: String) -> void:

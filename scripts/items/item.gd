@@ -1,6 +1,10 @@
 extends Node3D
-## Base class for hand-held items (keys 1-3: drill, rifle, shotgun). An item lives under the player camera (for
+## Base class for hand-held items (the drill, the build tool, the guns). An item lives under the player camera (for
 ## aiming) and builds its own first-person model, which the view model parents to the right hand.
+## Keys: only the tools have a fixed one (slot_key: drill 1, build tool 2); the guns get 3, 4, 5 …
+## from their place among the carried guns (Game.carried_guns(), player.gd). A gun script may declare
+## `const WEIGHT := 0.9`: its mobility factor while HELD (carry_weight(), default 1.0; player.gd
+## multiplies the walk / sprint speed by it).
 
 const VM := preload("res://scripts/player/vm_parts.gd")
 
@@ -9,6 +13,7 @@ var item_id := ""
 var item_name := ""
 var item_desc := ""
 var icon := ""                 # icon / prop id (the astronaut body holds a prop by this id)
+var slot_key := 0              # tools only: the number key that selects it (action "slot_N"); 0 = none (guns: loadout)
 var active := true             # false while piloting a vehicle
 var equipped := false          # true while this is the selected (and raised) hotbar item
 var using := false             # true while the item is working this frame (drives arm shake)
@@ -71,3 +76,11 @@ func status_text() -> String:
 ## One-line context hint shown above the hotbar while equipped (BBCode allowed).
 func hud_hint() -> String:
 	return ""
+
+
+## Mobility while this item is held: the script's `const WEIGHT` (rocket 0.86 ... SMG 1.05), else 1.0.
+func carry_weight() -> float:
+	var w = get("WEIGHT")
+	if w is float or w is int:
+		return clampf(float(w), 0.5, 1.5)
+	return 1.0

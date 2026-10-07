@@ -30,6 +30,9 @@ var exclude: Array = []
 var fuse_time := 0.0                   # 0 = only the life limit
 var _life := 0.0
 var _done := false
+## Multiplayer (scripts/net/net_world.gd): a client's rounds only show (the host's bursts do the
+## damage, the shell kills and the skiff notices).
+var net_puppet := false
 
 
 static func fire(parent: Node, from: Vector3, v: Vector3, p_team: String, p_exclude: Array = [],
@@ -41,6 +44,8 @@ static func fire(parent: Node, from: Vector3, v: Vector3, p_team: String, p_excl
 	r.fuse_time = p_fuse_time
 	parent.add_child(r)
 	r.global_position = from
+	if Net.active:
+		Net.world.on_flak_fired(r)
 	return r
 
 
@@ -143,6 +148,10 @@ func _fuse_targets() -> Array:
 func _burst(pos: Vector3) -> void:
 	_done = true
 	global_position = pos
+	if net_puppet or Net.is_client():
+		burst_fx(get_parent(), pos, 1.0)
+		queue_free()
+		return
 	Game.area_damage(pos, Balance.FLAK_BLAST_R, Balance.FLAK_DAMAGE, Balance.FLAK_IMPULSE, null, team)
 	Game.blast.emit(pos, Balance.FLAK_BLAST_R, team)
 	# Skiffs nearby notice the fire (autopilot evasion / the rival raid's retreat).

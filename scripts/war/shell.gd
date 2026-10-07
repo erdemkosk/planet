@@ -32,6 +32,11 @@ var _embers: GPUParticles3D
 var _light: OmniLight3D
 var _ball: MeshInstance3D
 var _done := false
+## Multiplayer (scripts/net/net_world.gd): every shell has an id; on a client it is a puppet that
+## flies for the look and waits for the host's impact (crater, damage and core hits are the host's).
+var net_id := 0
+var net_puppet := false
+var _net_fx_done := false
 
 
 static func fire(parent: Node, from: Vector3, v: Vector3, p_team: String, p_exclude: Array = [],
@@ -43,6 +48,8 @@ static func fire(parent: Node, from: Vector3, v: Vector3, p_team: String, p_excl
 	s.on_impact = p_on_impact
 	parent.add_child(s)
 	s.global_position = from
+	if Net.active:
+		Net.world.on_shell_fired(s, from, v)
 	return s
 
 
@@ -151,11 +158,17 @@ func _physics_process(delta: float) -> void:
 func _impact(point: Vector3, normal: Vector3) -> void:
 	_done = true
 	global_position = point
+	if net_puppet:
+		# Client: the host decides the impact; show it locally only if its word never comes.
+		_ball.visible = false
+		_light.visible = false
+		get_tree().create_timer(1.2).timeout.connect(net_impact.bind(point, normal))
+		return
 	var body: Node3D = Game.dominant_body(point)
 	var up: Vector3 = (point - body.global_position).normalized() if body != null else normal
 	# The crater: centred a little below the surface so it bites deeper than it spreads.
 	if body != null and body.has_method("crater"):
-		body.crater(point - up * 1.5, Balance.SHELL_CRATER_R, Balance.SHELL_CRATER_DEPTH)
+		body.crater(point - up * 1.5, Balance.SHELL_CRATER_R, Balance.SHELL_CRATER_DEPTH)    # × CRATER_SCALE in planet.gd
 	var ground: Color = Rifle.ground_color(point, normal)
 	Explosion.spawn(point + normal * 0.2, normal, {"radius": Balance.SHELL_BLAST_R, "damage": Balance.SHELL_DAMAGE,
 			"impulse": Balance.SHELL_IMPULSE, "self_mult": 1.0, "crater": 0.0, "player_owned": team == "home",
@@ -165,6 +178,27 @@ func _impact(point: Vector3, normal: Vector3) -> void:
 	_clods(point, up, soil)
 	if on_impact.is_valid():
 		on_impact.call(point, body)
+	if Net.is_host():
+		Net.world.on_shell_impact(self, point, normal)
+	_finish()
+
+
+## Client: the host's impact (or the fallback after a silent host): the explosion's look (no damage
+## on a client), the clods. The crater arrives as a terrain op.
+func net_impact(point: Vector3, normal: Vector3) -> void:
+	if _net_fx_done or not is_inside_tree():
+		return
+	_net_fx_done = true
+	_done = true
+	global_position = point
+	var body: Node3D = Game.dominant_body(point)
+	var up: Vector3 = (point - body.global_position).normalized() if body != null else normal
+	var ground: Color = Rifle.ground_color(point, normal)
+	Explosion.spawn(point + normal * 0.2, normal, {"radius": Balance.SHELL_BLAST_R, "damage": Balance.SHELL_DAMAGE,
+			"impulse": Balance.SHELL_IMPULSE, "self_mult": 1.0, "crater": 0.0, "player_owned": team == "home",
+			"ground": ground, "team": team})
+	var soil: Color = body.get("soil_color") if body != null and body.get("soil_color") != null else ground
+	_clods(point, up, soil)
 	_finish()
 
 
@@ -172,7 +206,7 @@ func _impact(point: Vector3, normal: Vector3) -> void:
 func _clods(point: Vector3, up: Vector3, col: Color) -> void:
 	var p := CPUParticles3D.new()
 	p.one_shot = true
-	p.amount = 40
+	p.amount = mini(int(40.0 * pow(Balance.CRATER_SCALE, 0.75)), 80)
 	p.lifetime = 3.2
 	p.explosiveness = 0.95
 	var bm := BoxMesh.new()
@@ -184,8 +218,8 @@ func _clods(point: Vector3, up: Vector3, col: Color) -> void:
 	p.mesh = bm
 	p.direction = up
 	p.spread = 50.0
-	p.initial_velocity_min = 8.0
-	p.initial_velocity_max = 22.0
+	p.initial_velocity_min = 8.0 * minf(sqrt(Balance.CRATER_SCALE), 1.4)
+	p.initial_velocity_max = 22.0 * minf(sqrt(Balance.CRATER_SCALE), 1.4)   # (capped: escape is ~22 m/s)
 	p.gravity = -up * 7.8
 	p.scale_amount_min = 0.5
 	p.scale_amount_max = 2.2
@@ -193,7 +227,7 @@ func _clods(point: Vector3, up: Vector3, col: Color) -> void:
 	p.angular_velocity_max = 300.0
 	p.particle_flag_rotate_y = true
 	p.color = col
-	p.visibility_aabb = AABB(Vector3.ONE * -120.0, Vector3.ONE * 240.0)
+	p.visibility_aabb = AABB(Vector3.ONE * -160.0, Vector3.ONE * 320.0)
 	var parent: Node = get_tree().current_scene if get_tree().current_scene != null else get_parent()
 	parent.add_child(p)
 	p.global_position = point + up * 0.5
@@ -209,9 +243,12 @@ func is_live() -> bool:
 ## Destroyed in the air by an enemy flak burst at `by_pos`: a bigger airburst, no crater, no damage
 ## on the ground (the AI does not learn from it).
 func shot_down(_by_pos: Vector3) -> void:
-	if _done:
+	if _done and not (net_puppet and not _net_fx_done):
 		return
 	_done = true
+	_net_fx_done = true
+	if Net.is_host():
+		Net.world.on_shell_down(self)
 	FlakRound.burst_fx(get_parent(), global_position, 1.8)
 	if Game.hud and team == "rival":
 		Game.hud.show_message("Düşman mermisi havada vuruldu!", 1.6)

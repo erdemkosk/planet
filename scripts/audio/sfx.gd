@@ -11,14 +11,29 @@ extends Node
 ## reaches the listener: through the air, muffled through your own suit / vessel, as a dull thud
 ## through the ground you stand on, or not at all. Every AudioStreamPlayer3D in the tree is routed
 ## automatically (node_added hook); 2D one-shots follow the listener's medium.
+##
+## Room: in the air, world sounds go through the "Env" bus (ENV_BUS: 3D players otherwise on
+## Master, non-UI 2D one-shots and footsteps, the drill / jetpack loops), whose reverb and slap-back
+## echo the child `acoustics` (scripts/audio/acoustics.gd) sizes continuously from rays around the
+## listener; it drives the guns' "Weapons" bus reverb the same way and plays the underground room
+## tone. The child `radio` (scripts/audio/radio_fx.gd) is the rival bots' radio chatter.
+##
+## Handling foley (section at the end): the named sets FOLEY_SETS (cloth, gear, grip, tick, clunk,
+## tap, ... and the melee hits) that the weapon handling (scripts/items/handling.gd), the view model
+## and the melee (scripts/player/melee.gd) play through play() / play_later(name, delay, db, pitch);
+## and the player's own gear on the footstep clock: a kit rattle per step (sprint loud, walk faint,
+## crouch near silent), a jump rustle, a landing clank scaled by the fall speed, slide in / out.
 
 const Snd := preload("res://scripts/audio/snd_lib.gd")
+const Acoustics := preload("res://scripts/audio/acoustics.gd")
+const RadioFx := preload("res://scripts/audio/radio_fx.gd")
+const ENV_BUS := "Env"      # world sounds in the air: through the measured room (acoustics.gd)
 
 const ROUTE_AIR := 0        # normal
 const ROUTE_HULL := 1       # through your own vessel / suit: muffled rumble
 const ROUTE_GROUND := 2     # through the ground you stand on: dull low thud
 const ROUTE_NONE := 3       # vacuum, no contact: silent
-const GROUND_RANGE := 45.0  # m: farther ground-borne sounds are lost
+const GROUND_RANGE := 70.0  # m: farther ground-borne sounds are lost (45 at R 30: the core is ~57 m down now)
 const ROUTE_BUS := ["", "VacHull", "VacGround", "VacMute"]
 ## UI sounds: always heard (they are in your helmet).
 const UI_NAMES := {"click": true, "select": true, "open": true, "close": true, "error": true, "toggle": true,
@@ -46,11 +61,19 @@ var listener_ground := false
 var _lis_owner: Array = []    # nodes whose sounds are "own": the player, the vehicle you are in
 var _p3d := {}                # instance id -> AudioStreamPlayer3D (every 3D player in the tree)
 var _wlp: AudioEffectLowPassFilter   # vacuum muffle on the Weapons bus
+var acoustics                 # scripts/audio/acoustics.gd: the listener's room (reverb, echo, ambience)
+var radio                     # scripts/audio/radio_fx.gd: the rival bots' radio chatter
 
 
 func _ready() -> void:
 	_rng.seed = 99
 	_setup_buses()
+	acoustics = Acoustics.new()   # creates the Env bus before anything is routed to it
+	acoustics.name = "Acoustics"
+	add_child(acoustics)
+	radio = RadioFx.new()
+	radio.name = "Radio"
+	add_child(radio)
 	_add_loop_stream("wind", Snd.loop("amb/wind_gusty"))
 	_add_loop_stream("dig", Snd.loop("ship/dig_beam"))
 	_add_loop_stream("jet", Snd.loop("ship/jetpack"))
@@ -153,6 +176,7 @@ func set_loop(name: String, volume: float, pitch := 1.0) -> void:
 func _process(delta: float) -> void:
 	_update_listener()
 	_drive(delta)
+	_foley(delta)                 # handling foley: delayed one-shots, the player's gear (section at the end)
 	_route_3d()
 	var k := 1.0 - exp(-8.0 * delta)
 	for name in _loops:
@@ -175,7 +199,7 @@ func _drive(delta: float) -> void:
 	var vac := listener_air < 0.05
 	set_loop("wind", air * (0.18 + clampf(speed / 60.0, 0.0, 1.0) * 0.8), 0.85 + clampf(speed / 150.0, 0.0, 0.5))
 	for n: String in ["dig", "jet"]:
-		(_loops[n]["player"] as AudioStreamPlayer).bus = "VacSuit" if vac else "Master"
+		(_loops[n]["player"] as AudioStreamPlayer).bus = "VacSuit" if vac else ENV_BUS
 	_weapons_vacuum(vac, delta)
 	var pl = Game.player
 	if pl != null and is_instance_valid(pl) and pl.vehicle == null and pl.tool != null:
@@ -269,10 +293,12 @@ func _update_listener() -> void:
 		_lis_owner.append(c)
 
 
-## 2D bus for a one-shot by name, from the listener's medium.
+## 2D bus for a one-shot by name, from the listener's medium (in the air: the Env room reverb).
 func _bus_2d(name: String) -> String:
-	if listener_air > 0.05 or UI_NAMES.has(name):
+	if UI_NAMES.has(name):
 		return "Master"
+	if listener_air > 0.05:
+		return ENV_BUS
 	if WORLD_NAMES.has(name):
 		return "VacGround" if listener_ground else "VacMute"
 	return "VacSuit"
@@ -330,12 +356,13 @@ func _route_3d() -> void:
 func _apply_route(p: AudioStreamPlayer3D, route: int) -> void:
 	var cur: String = str(p.bus)
 	var orig: String = str(p.get_meta("snd_bus0")) if p.has_meta("snd_bus0") else cur
-	# Players on a bus of their own apply the vacuum rule themselves; only Master players are routed.
-	if orig != "Master" and orig != "":
+	# Players on a bus of their own apply the vacuum rule themselves; only Master players are routed
+	# (in the air through the Env bus: the room reverb of acoustics.gd).
+	if orig != "Master" and orig != "" and orig != ENV_BUS:
 		return
 	if route == ROUTE_GROUND and p.has_meta("snd_air_only"):
 		route = ROUTE_NONE
-	var want: String = orig if route == ROUTE_AIR else ROUTE_BUS[route]
+	var want: String = ENV_BUS if route == ROUTE_AIR else ROUTE_BUS[route]
 	if cur == want:
 		return
 	if route != ROUTE_AIR and not p.has_meta("snd_bus0"):
@@ -457,6 +484,7 @@ func _load_variants() -> void:
 	_set_variants("error", ["ui/error_001", "ui/error_002"])
 	_set_variants("toggle", ["ui/toggle_001", "ui/toggle_002"])
 	_set_variants("switch", ["ui/switch_001", "ui/switch_002", "ui/switch_003"])
+	_load_foley_variants()
 
 
 ## Footstep set of the planet underfoot (bodies.gd "step": "step_dirt" at home, "step_rock" on the
@@ -471,3 +499,132 @@ func _step_surface() -> String:
 		if _variants.has(s):
 			return s
 	return "step_dirt"
+
+
+# ------------------------------------------------------------------------------------------
+# Handling foley: named sets, delayed one-shots, the player's own gear on the footstep clock
+# ------------------------------------------------------------------------------------------
+
+const Handling := preload("res://scripts/items/handling.gd")
+## Named handling sets (assets/audio/sonniss/...): processed Sonniss recordings (gun handling,
+## cartridge clinks, soldier footsteps, Gorification, Gamemaster, Mechanical Wave, lever switches)
+## layered with synthesized fabric. Dropping better recordings in under the same file names
+## (e.g. foley/cloth_01..) replaces a set without code changes.
+const FOLEY_SETS := {
+	"cloth": "foley/cloth", "cloth_long": "foley/cloth_long", "gear": "foley/gear", "grip": "foley/grip",
+	"tick": "foley/tick", "clunk": "foley/clunk", "tap": "foley/tap", "rattle": "foley/rattle",
+	"gear_land": "foley/land", "gear_jump": "foley/jump", "slide_in": "foley/slide", "settle": "foley/settle",
+	"draw": "foley/draw", "holster": "foley/holster", "swing": "foley/swing",
+	"melee_flesh": "melee/flesh", "melee_dirt": "melee/dirt", "melee_metal": "melee/metal",
+}
+
+var _later: Array = []            # delayed one-shots: [seconds left, name, dB, pitch]
+var _gear_on := false
+var _gear_half := -1
+var _gear_ground := true
+var _gear_air := 0.0
+var _gear_fall := 0.0
+var _gear_slide := false
+var _gear_crouch := false
+var _gear_cloth := false
+
+
+## Plays `name` (play()) after `delay` seconds: foley timed to an animation.
+func play_later(name: String, delay: float, volume_db := 0.0, pitch := 1.0) -> void:
+	if delay <= 0.0:
+		play(name, volume_db, pitch)
+	elif _later.size() < 32:
+		_later.append([delay, name, volume_db, pitch])
+
+
+func _load_foley_variants() -> void:
+	for n: String in FOLEY_SETS:
+		_variants[n] = Snd.set_of(FOLEY_SETS[n])
+
+
+func _foley(delta: float) -> void:
+	if not _later.is_empty():
+		for i in range(_later.size() - 1, -1, -1):
+			var e: Array = _later[i]
+			e[0] = float(e[0]) - delta
+			if float(e[0]) <= 0.0:
+				_later.remove_at(i)
+				play(str(e[1]), float(e[2]), float(e[3]))
+	_gear(delta)
+
+
+## The player's own kit: a rattle on every footstep of the body's gait (the clock of player.gd
+## _footsteps), a rustle on the jump take-off, a clank on landing (scaled by the fall speed), slide
+## in / out, a cloth shift on crouch / stand. Louder with a heavier item in hand.
+func _gear(delta: float) -> void:
+	var pl = Game.player
+	var ok: bool = pl != null and is_instance_valid(pl) and pl.vehicle == null and not pl.is_ragdolled() \
+			and not pl.is_dead() and pl.get("waiting_ground") != true and pl.get("zero_g") != true
+	if not ok:
+		_gear_on = false
+		return
+	var on_floor: bool = pl.is_on_floor()
+	var up: Vector3 = pl.global_transform.basis.y
+	var vel: Vector3 = pl.velocity
+	var v_up := vel.dot(up)
+	var hs := (vel - up * v_up).length()
+	var sliding: bool = pl.get("sliding") == true
+	var crouched: bool = pl.get("crouching") == true
+	if not _gear_on:
+		# (Re)started (spawn, out of a vehicle / ragdoll): no events from stale state.
+		_gear_on = true
+		_gear_ground = on_floor
+		_gear_slide = sliding
+		_gear_crouch = crouched
+		_gear_half = -1
+		_gear_air = 0.0
+		_gear_fall = 0.0
+		return
+	var it = pl.items[pl.current_item] if pl.current_item < pl.items.size() else null
+	var w := float(Handling.spec(it)["weight"])
+	# Steps.
+	if on_floor and hs > 1.0 and not sliding and pl.astronaut != null:
+		var half := floori(float(pl.astronaut._phase) * 2.0)
+		if half != _gear_half:
+			if _gear_half != -1:
+				_gear_step(hs, clampf(float(pl.get("_sprint_k")), 0.0, 1.0), clampf(float(pl.get("crouch_k")), 0.0, 1.0), w)
+			_gear_half = half
+	# Jump take-off / landing.
+	if on_floor:
+		if not _gear_ground and (_gear_air > 0.25 or _gear_fall > 2.5):
+			var k := clampf((_gear_fall - 2.0) / 8.0, 0.0, 1.0)
+			play("gear_land", lerpf(-24.0, -9.0, k) + w * 2.0, lerpf(1.04, 0.9, k))
+			if k > 0.3:
+				play_later("rattle", 0.06, lerpf(-24.0, -14.0, k), 0.95)
+		_gear_air = 0.0
+		_gear_fall = 0.0
+	else:
+		if _gear_ground and v_up > 1.2 and Input.is_action_pressed("jump"):
+			play("gear_jump", -17.0 + w * 2.0, _rng.randf_range(0.96, 1.04))
+		_gear_air += delta
+		_gear_fall = maxf(_gear_fall, -v_up)
+	_gear_ground = on_floor
+	# Slide in / out; crouch / stand.
+	if sliding != _gear_slide:
+		_gear_slide = sliding
+		if sliding:
+			play("slide_in", -13.0 + w * 2.0, 1.0)
+		else:
+			play("settle", -18.0 + w * 2.0, 1.0)
+	elif crouched != _gear_crouch and not sliding:
+		play("cloth", -24.0, 0.94 if crouched else 1.04)
+	_gear_crouch = crouched
+
+
+## One step's kit rattle: faint walking, much louder sprinting (plus a cloth swish every other
+## sprint step), near silent crouched.
+func _gear_step(hs: float, sprint: float, crouch: float, w: float) -> void:
+	var run := maxf(sprint, clampf((hs - 3.6) / 2.6, 0.0, 1.0))
+	var db := lerpf(-28.0, -16.0, run) + (w - 0.5) * 5.0 - crouch * 9.0
+	if db < -39.0:
+		return
+	play("rattle", db, _rng.randf_range(0.95, 1.05) * lerpf(1.04, 0.94, w))
+	if run > 0.5:
+		_gear_cloth = not _gear_cloth
+		if _gear_cloth:
+			play("cloth", lerpf(-30.0, -22.0, run), _rng.randf_range(0.92, 1.06))

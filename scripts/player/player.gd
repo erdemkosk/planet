@@ -1,10 +1,23 @@
 extends CharacterBody3D
 ## The player: first-person astronaut on a small voxel planet. Walks on whatever gravity applies
 ## (Game.gravity_at: both planets, "up" from the strongest pull), hops with a weak short jetpack,
-## holds four hand items (1 drill, 2 rifle, 3 shotgun, 4 build tool), has a helmet headlamp (L), takes damage
+## holds hand items, has a helmet headlamp (L), takes damage
 ## (group "damageable"), ragdolls on hard hits / death and respawns on the home planet.
 ## The full-body astronaut model (scripts/player/astronaut.gd) is shadow-only in first person and
 ## drives the ragdoll (scripts/player/ragdoll.gd).
+## Quickbar (2026-10-06, "2 silah sınırı da kalksın"): every gun is in `items`; the ones you own
+## (made at a Silahlık) and loot guns (picked up) are carried, all of them: 1 the drill, 2 the build
+## tool (their item.slot_key), 3, 4, 5 … 9, 0 the carried guns in Game.GUN_ORDER compacted to the
+## ones you have (Game.carried_guns(), select_slot); the wheel cycles the guns while one is held (the
+## drill / build tool keep the wheel; a scoped sniper zooms). A gun's const WEIGHT (item.gd
+## carry_weight) scales the walk / sprint speed while it is held. Death drops the gun in hand
+## (scripts/war/weapon_drop.gd, a copy) and loses the loot guns; the respawn re-equips the item held
+## last (a lost loot gun: the gun before it, else the first gun, else the drill). Guns on the
+## ground: F held takes them (take_dropped_gun: a new loot gun, or the ammo of one you have).
+## Crouch (hold Ctrl / toggle C) and the sprint slide: scripts/player/stance.gd (`stance`; it
+## publishes crouching, crouch_k, sliding, slide_k, fov_kick here).
+## Mantling (jump at a ledge: the hands grab it, pull up and over): scripts/player/mantle.gd
+## (`mantle`; signal mantled).
 ##
 ## Damage API (shared with the AI rival bot later, see Game.damage_target / area_damage):
 ##   take_damage(amount, from_pos = ZERO, impulse = ZERO) -> {"dmg": float, "killed": bool}
@@ -15,19 +28,51 @@ extends CharacterBody3D
 ## (refuse F, e.g. the shuttle in flight), shield_pilot(amount, from_pos) -> float (damage that
 ## still reaches the pilot inside).
 
+## A melee swing started (V, scripts/player/melee.gd under viewmodel.melee): eye and view direction.
+## Multiplayer replays it on the remote avatar; the damage itself goes through Game.damage_target.
+signal melee_swung(from: Vector3, dir: Vector3)
+## We reacted to a hit (scripts/player/hit_reactor.gd PlayerFeel, local): kind "flinch" / "stagger"
+## (a heavy hit: stumble) / "knockdown" (the ragdoll) / "death" (the death's ragdoll) / "getup";
+## dir × strength = the velocity change
+## (getup: dir = facing, strength = its duration s); bone = the body part struck ("" unknown).
+## Multiplayer mirrors it on the remote avatar.
+signal hit_reacted(kind: String, dir: Vector3, strength: float, bone: String)
+## A mantle started (scripts/player/mantle.gd): the feet at the start and at the end of the climb,
+## and the ledge height over the start (m). Multiplayer replays it on the remote avatar.
+signal mantled(from: Vector3, to: Vector3, height: float)
+
 const Settings := preload("res://scripts/save/settings.gd")
 const TerrainTool := preload("res://scripts/player/terrain_tool.gd")
 const Rifle := preload("res://scripts/items/rifle.gd")
 const Shotgun := preload("res://scripts/items/shotgun.gd")
-const BuildTool := preload("res://scripts/war/build_tool.gd")     # key 4
+const BuildTool := preload("res://scripts/war/build_tool.gd")     # key 4 (slot_key; the drill: 3)
+const KineticPusher := preload("res://scripts/items/kinetic_pusher.gd")       # guns: the loadout (keys 1 / 2)
+const RocketLauncher := preload("res://scripts/items/rocket_launcher.gd")
+const WeaponDrop := preload("res://scripts/war/weapon_drop.gd")              # guns on the ground (death drops, swaps)
+# (scripts/items/torpedo_launcher.gd, was key 8: out of the loadout, the torpedo is built: Sondaj Kulesi)
+const Railgun := preload("res://scripts/items/railgun.gd")                    # "rail": Delici Raylı Tüfek (loadout key)
+const Smg := preload("res://scripts/items/smg.gd")                            # "smg": Hafif Makineli (loadout key)
+const PlasmaCutter := preload("res://scripts/items/plasma_cutter.gd")         # "plasma": Plazma Kesici (loadout key)
+const DirtLauncher := preload("res://scripts/items/dirt_launcher.gd")         # "dirt": Toprak Topu (loadout key)
+const Mortar := preload("res://scripts/items/mortar.gd")                      # "mortar": Havan (loadout key)
+const Pistol := preload("res://scripts/items/pistol.gd")                      # "pistol": Tabanca (sidearm, loadout B)
+const Revolver := preload("res://scripts/items/revolver.gd")                  # "revolver": Altıpatlar (sidearm)
+const MPistol := preload("res://scripts/items/mpistol.gd")                    # "mpistol": Makineli Tabanca (sidearm)
+const Sniper := preload("res://scripts/items/sniper.gd")                      # "sniper" (loadout key)
+const Stance := preload("res://scripts/player/stance.gd")                     # crouch (Ctrl / C) + slide
+const Mantle := preload("res://scripts/player/mantle.gd")                     # ledge grab and climb
+const HandAction := preload("res://scripts/player/hand_action.gd")            # G grenade, Q scan
 const Viewmodel := preload("res://scripts/player/viewmodel.gd")
 const Astronaut := preload("res://scripts/player/astronaut.gd")
 const Ragdoll := preload("res://scripts/player/ragdoll.gd")
 const DigFx := preload("res://scripts/items/dig_fx.gd")
 const VMParts := preload("res://scripts/player/vm_parts.gd")
-const TWO_HAND := ["terrain", "rifle", "shotgun", "build"]
+const HitReactor := preload("res://scripts/player/hit_reactor.gd")            # hit_fx: PlayerFeel
+const Downed := preload("res://scripts/war/downed.gd")                        # downed / revive / drag (lethal hits)
+const DownedView := preload("res://scripts/player/downed_view.gd")            # ...our view while downed
+const TWO_HAND := ["terrain", "rifle", "shotgun", "build", "pusher", "rocket", "torpedo", "sniper", "rail", "smg", "plasma", "dirt", "mortar"]
 
-const HP_MAX := 100.0
+const HP_MAX := 135.0                     # (2026-10-06 tok: 100 -> 135 with Balance.AI_HP; remote_avatar.gd mirrors it)
 const REGEN_DELAY := 6.0
 const REGEN_RATE := 7.0                   # hp per second
 const RESPAWN_DELAY := 4.0                # s on the ground (ragdoll) after dying
@@ -36,13 +81,38 @@ const RAGDOLL_PUSH := 7.5                 # m/s of external velocity change (bla
 const GETUP_TIME := 1.4
 const FALL_DMG_SPEED := 10.0             # m/s of impact before landings hurt
 
-const WALK := 3.6                          # m/s, brisk walk in a suit
-const SPRINT := 6.2                        # m/s, reached after a ~0.4 s ramp
+## 2026-10-05 the user found moving slow ("hareket yavaş"): 3.6 / 6.2 -> 5.0 / 8.2 (stance.gd
+## PLAYER_SPRINT mirrors SPRINT; the guns' sprint pose starts above 5 m/s).
+## 2026-10-06 tok (the user: "oyun daha yavaş, tok hissettirmeli ... karakter vb aşırı hızlı"): a heavier
+## suit: 5.0 / 8.2 -> 4.2 / 6.8, real inertia (ACCEL / DECEL below), a slower sprint build-up, a landing
+## that plants you (LAND_*), a slower, deeper head bob (BOB_*).
+const WALK := 4.2                          # m/s, a steady walk in a suit (tok: 5.0 -> 4.2)
+const SPRINT := 6.8                        # m/s, reached after a ~0.6 s ramp (tok: 8.2 -> 6.8)
 const JUMP := 2.9                          # m/s take-off
+# Ground acceleration (m/s²): starting / steering, stopping, turning around; little control in the air.
+const ACCEL := 8.5                         # (tok: 12 -> 8.5: ~0.5 s to walking speed)
+const DECEL := 11.0                        # (tok: 15 -> 11: ~0.4 s / ~0.6 m to stop from a walk)
+const TURN_DECEL := 14.0                   # (tok: 16 -> 14: a reversal still plants the feet)
+const AIR_ACCEL := 2.2
+const SPRINT_RAMP := 0.6                   # s from walk to full sprint once it kicks in (tok: 0.4 -> 0.6)
+const SPRINT_EASE := 0.45                  # s back down when released (tok: 0.35 -> 0.45)
+# Landing: a fall faster than LAND_SLOW_V0 m/s slows the next steps (up to LAND_SLOW at LAND_SLOW_V1 m/s,
+# easing out over LAND_SLOW_T s) and dips the view by LAND_DIP m/s per m/s of fall into the head's
+# landing spring (tok: new; the dip was 0.012, a ~3 mm dip nobody saw: now ~2 cm after a jump, ~5 cm
+# from 2.5 m, at most ~9 cm).
+const LAND_SLOW := 0.45
+const LAND_SLOW_V0 := 3.0
+const LAND_SLOW_V1 := 8.0
+const LAND_SLOW_T := 0.4
+const LAND_DIP := 0.15
+# Head bob: dip per step and sway per stride (m) at full run (tok: 0.022 / 0.01 -> 0.028 / 0.013).
+const BOB_DIP := 0.028
+const BOB_SWAY := 0.013
+const EYE_H := 1.72                        # eye height: the visor of the 1.92 m suit (the first-person body view lines up)
 # Jetpack: a weak, short hop out of a pit / over a crater rim, never off the planet.
 const JET_ACCEL := 10.5                   # m/s² (just above the 7.85 m/s² surface gravity)
 const JET_FUEL := 2.5                     # s of burn
-const JET_MAX_CLIMB := 4.0                # m/s
+const JET_MAX_CLIMB := 3.6                # m/s (2026-10-06 tok: 4.0 -> 3.6)
 const JET_FULL_H := 8.0                   # full thrust below this height above the ground
 const JET_ZERO_H := 20.0                  # no thrust above this
 const JET_REFILL_DELAY := 0.8             # s on the ground before it refills...
@@ -56,10 +126,11 @@ var head: Node3D
 var camera: Camera3D
 var flashlight: SpotLight3D               # the helmet headlamp
 var tool                                  # the drill (sfx.gd and the arms read it)
-var items: Array = []                     # hand items by key: 1 drill, 2 rifle, 3 shotgun, 4 build tool
+var items: Array = []                     # every hand item (the drill, the guns, the build tool); keys: see above
 var current_item := 0
 var viewmodel                             # first-person arms
-var astronaut                             # full-body model (shadow-only in first person; ragdoll source)
+var hand_action                           # scripts/player/hand_action.gd: G grenade throw, Q scanner pulse
+var astronaut                           # full-body model (shadow-only in first person; ragdoll source)
 var vehicle = null
 var jet_fuel := JET_FUEL
 var jetting := false
@@ -68,9 +139,21 @@ var gravity_vec := Vector3.ZERO
 var interact_target = null
 var move_speed_mult := 1.0                # set by items (e.g. rifle aiming); 1 = normal
 var look_scale := 1.0                     # mouse-look sensitivity multiplier (aiming)
+## The mouse look of the last frame (pitch, yaw rad, as applied): the held gun's view climb reads it
+## (gun_feel.gd Climb: pulling down against the recoil eats the climb, add_view_kick turns the view).
+var look_frame := Vector2.ZERO
+var _look_acc := Vector2.ZERO
 var hp := HP_MAX
 var hp_max := HP_MAX
 var waiting_ground := false               # spawned: hold still until the ground under us is built
+# Stance (scripts/player/stance.gd writes these; weapons and multiplayer read them).
+var stance
+var crouching := false
+var crouch_k := 0.0                       # eased 0..1 (crouch or slide)
+var sliding := false
+var slide_k := 0.0
+var fov_kick := 0.0                       # degrees added to the camera FOV (slide)
+var mantle                                # scripts/player/mantle.gd: ledge grab and climb
 
 var _pitch := 0.0
 var _jump_hold := 0.0
@@ -82,6 +165,10 @@ var _shake_t := 0.0
 var _held_icon := ""
 var _lamp_on := false
 var _pending_equip := -1
+var _last_gun := ""                       # item_id of the gun held last (the fallback when one is lost)
+var _loadout_dirty := false               # the carried guns changed: re-check the held gun (on foot)
+var _wheel_t := 0.0                       # s until the wheel may switch the gun again
+var _weight := 1.0                        # eased carry_weight() of the held item
 var _sprint_k := 0.0
 var _sprint_hold := 0.0
 var _bob_amt := 0.0
@@ -90,6 +177,8 @@ var _coyote := 0.0
 var _jump_buf := 0.0
 var _land_off := 0.0
 var _land_vel := 0.0
+var _land_slow := 0.0                     # share of the walk speed a hard landing takes away (LAND_SLOW)...
+var _land_slow_t := 0.0                   # ...fading out over these last s (LAND_SLOW_T)
 var _phys_prev := Vector3.ZERO            # body position at the previous / last physics step (view smoothing)
 var _phys_cur := Vector3.ZERO
 var _prev_fwd := Vector3.ZERO
@@ -115,6 +204,8 @@ var _punch := Vector3.ZERO
 var _trauma := 0.0
 var _trauma_t := 0.0
 var _spawn_body: Node3D
+var _net_auth := false                   # multiplayer: applying the host's hurt (net_hurt)
+var hit_fx = HitReactor.PlayerFeel.new() # hit reactions: aim punch, knockback kick, tagging, stumble
 
 
 func _ready() -> void:
@@ -134,9 +225,15 @@ func _ready() -> void:
 	_col.shape = shape
 	_col.position = Vector3(0, 0.9, 0)
 	add_child(_col)
+	stance = Stance.new()
+	stance.setup(self, _col)
+	add_child(stance)
+	mantle = Mantle.new()                     # (right after the stance: its FOV ease adds to fov_kick)
+	mantle.setup(self)
+	add_child(mantle)
 
 	head = Node3D.new()
-	head.position = Vector3(0, 1.6, 0)
+	head.position = Vector3(0, EYE_H, 0)
 	add_child(head)
 	camera = Camera3D.new()
 	camera.near = 0.05
@@ -154,9 +251,22 @@ func _ready() -> void:
 
 	tool = TerrainTool.new()
 	items = [tool, Rifle.new(), Shotgun.new(), BuildTool.new()]
+	# (The order does not decide any key: the tools have their slot_key, the guns the loadout.)
+	items.append_array([KineticPusher.new(), RocketLauncher.new()])
+	items.append(Sniper.new())
+	items.append_array([Railgun.new(), Smg.new()])      # "rail", "smg": slot_key 0 (the loadout picks the key)
+	items.append(PlasmaCutter.new())                    # "plasma": Plazma Kesici (slot_key 0)
+	items.append(DirtLauncher.new())                    # "dirt": Toprak Topu (slot_key 0)
+	items.append(Mortar.new())                          # "mortar": Havan (slot_key 0)
+	items.append_array([Pistol.new(), Revolver.new(), MPistol.new()])   # sidearms "pistol" / "revolver" / "mpistol" (slot_key 0)
 	for it in items:
 		it.player = self
 		camera.add_child(it)
+	hand_action = HandAction.new()
+	hand_action.player = self
+	add_child(hand_action)
+	_entrench = preload("res://scripts/player/entrench.gd").new()   # Z held: quick foxhole (after hand_action: drives its left arm)
+	add_child(_entrench)
 	viewmodel = Viewmodel.new()
 	camera.add_child(viewmodel)
 	viewmodel.setup(self, items)
@@ -164,6 +274,7 @@ func _ready() -> void:
 		it.set_equipped(false)
 	viewmodel.swap_to(items[0], _on_item_raised.bind(0))
 	camera.current = true
+	Game.loadout_changed.connect(_on_loadout_changed)
 
 
 func _set_layers(n: Node, layer_bits: int) -> void:
@@ -185,11 +296,15 @@ func spawn(body: Node3D) -> void:
 	global_transform = xf
 	velocity = Vector3.ZERO
 	_last_vel = Vector3.ZERO
-	# Look up a little so the other planet (~30° above the horizon) is framed in the sky.
+	# Frame both: aim halfway between the real horizon (it dips ~14° on a 60 m ball: acos(R / (R +
+	# eye height))) and the other planet (~32° up), so the ground shows in the lower third and the
+	# other planet in the upper part (the old "elevation - 0.2" pitch showed sky only).
 	_pitch = 0.0
 	if other != null and is_instance_valid(other):
 		var to_other: Vector3 = (other.global_position - xf.origin).normalized()
-		_pitch = clampf(asin(clampf(to_other.dot(xf.basis.y), -1.0, 1.0)) - 0.2, 0.0, 0.5)
+		var r_ground: float = xf.origin.distance_to(body.global_position) - 1.5      # spawn_transform's lift
+		var dip := acos(clampf(r_ground / maxf(r_ground + EYE_H, 0.01), -1.0, 1.0))
+		_pitch = clampf((asin(clampf(to_other.dot(xf.basis.y), -1.0, 1.0)) - dip) * 0.5, 0.0, 0.25)
 	head.rotation.x = _pitch
 	_phys_prev = global_position
 	_phys_cur = global_position
@@ -244,26 +359,169 @@ func aim_origin() -> Vector3:
 	return camera.global_position
 
 
-## Selects a hand item: lowers the current one, swaps the model and raises the new one.
+## Selects a hand item: lowers the current one, swaps the model and raises the new one. A gun only
+## when it is carried (Game.can_hold: the loadout, an İkmal kapsülü gun, or a loot gun from the ground).
 func select_item(i: int) -> void:
 	if i < 0 or i >= items.size() or i == current_item:
 		return
+	var id := str(items[i].item_id)
+	if not is_tool(items[i]) and not Game.can_hold(id):
+		if Game.hud:
+			var bal := preload("res://scripts/war/balance.gd")
+			var fmt := "%s yüklemende değil — Silahlık › YÜKLEME'den seç" if id in bal.LOADOUT_A or id in bal.LOADOUT_B \
+					else "%s yok — İkmal kapsülüyle gelir (Tab)"
+			Game.hud.show_message(fmt % str(items[i].item_name), 1.6)
+		if Game.sfx:
+			Game.sfx.play("error", -14.0)
+		return
+	if not is_tool(items[i]):
+		_last_gun = id
 	for it in items:
 		it.set_equipped(false)
 	current_item = i
 	_pending_equip = i
 	viewmodel.swap_to(items[i], Callable())
 	if Game.sfx:
-		Game.sfx.play("select", -12.0, 0.9 + i * 0.08)
+		Game.sfx.play("select", -12.0, 0.9 + (float(held_slot()) + 1.0) * 0.06)
 
 
 func current() -> Object:
 	return items[current_item]
 
 
+## The drill, the build tool, the bare hands (not a gun: no place among the carried guns).
+static func is_tool(it: Object) -> bool:
+	return it != null and str(it.get("item_id")) in Game.FREE_ITEMS
+
+
+func item_index(id: String) -> int:
+	for i in items.size():
+		if str(items[i].item_id) == id:
+			return i
+	return -1
+
+
+## Index of the held gun among the carried guns (Game.carried_guns(); key = 3 + index), -1 for a tool.
+func held_slot() -> int:
+	var it = items[current_item] if current_item < items.size() else null
+	if it == null or is_tool(it):
+		return -1
+	return Game.gun_index(str(it.item_id))
+
+
+## Keys 3, 4, 5 …: the s-th carried gun (none there: a hint).
+func select_slot(s: int) -> void:
+	var id := Game.loadout_id(s)
+	if id == "":
+		if Game.hud:
+			var n := Game.carried_guns().size()
+			Game.hud.show_message("Silahın yok — İkmal kapsülü çağır (Tab)" if n == 0
+					else "Tuş %s boş — %d silahın var (%s–%s)" % [Game.key_label(s), n, Game.key_label(0), Game.key_label(n - 1)], 1.6)
+		if Game.sfx:
+			Game.sfx.play("error", -16.0)
+		return
+	var i := item_index(id)
+	if i >= 0:
+		select_item(i)
+
+
+## Game.loadout_changed: the held gun is checked once the controls are ours (_fix_held).
+func _on_loadout_changed() -> void:
+	_loadout_dirty = true
+
+
+## The held gun is no longer carried (a lost loot gun): the gun held before it, else the first
+## carried gun, else the drill. swap = false only picks it (the respawn raises it itself).
+func _fix_held(swap := true) -> void:
+	_loadout_dirty = false
+	var it = items[current_item] if current_item < items.size() else null
+	if it != null and (is_tool(it) or Game.can_hold(str(it.item_id))):
+		return
+	var pick := -1
+	if _last_gun != "" and Game.can_hold(_last_gun) and (it == null or _last_gun != str(it.item_id)):
+		pick = item_index(_last_gun)
+	if pick < 0:
+		var guns := Game.carried_guns()
+		pick = item_index(str(guns[0])) if not guns.is_empty() else -1
+	if pick < 0:
+		pick = maxi(item_index("terrain"), 0)
+	if swap:
+		select_item(pick)
+	else:
+		current_item = pick
+		if not is_tool(items[pick]):
+			_last_gun = str(items[pick].item_id)
+
+
+## The wheel while a gun is held: the next (dir 1) / previous (-1) carried gun, wrapping.
+func _wheel_swap(dir: int) -> bool:
+	var s := held_slot()
+	if s < 0:
+		return false
+	if _wheel_t > 0.0:
+		return true
+	var n := Game.carried_guns().size()
+	if n < 2:
+		return true
+	_wheel_t = 0.12
+	select_slot(posmod(s + dir, n))
+	return true
+
+
+## A gun taken from the ground (scripts/war/weapon_drop.gd; data: item, pos, state, ammo, reserve).
+## One we already carry: its rounds (magazine + reserve) go to our reserve. A new one is carried from
+## now on (a loot gun when we have not made it: lost on death) with the dropped gun's magazine and
+## mode (save_state) and its reserve, and taken in hand.
+func take_dropped_gun(d: Dictionary) -> void:
+	var id := str(d.get("item", ""))
+	var i := item_index(id)
+	if i < 0:
+		return
+	var it = items[i]
+	var st = d.get("state")
+	var state: Dictionary = st if st is Dictionary else {}
+	var ammo_id := str(d.get("ammo", ""))
+	var reserve := int(d.get("reserve", 0))
+	if Game.can_hold(id):
+		var rounds := reserve + WeaponDrop.state_rounds(state)
+		if ammo_id != "" and rounds > 0:
+			Game.ammo[ammo_id] = Game.ammo_reserve(ammo_id) + rounds
+			Game.ammo_changed.emit()
+		if Game.hud:
+			Game.hud.show_message("+%d mermi  ·  %s" % [rounds, str(it.item_name)], 2.0)
+		if Game.sfx:
+			Game.sfx.play("grip", -8.0, 1.05)
+		return
+	if not state.is_empty() and it.has_method("load_state"):
+		it.load_state(state)
+	if reserve > 0 and ammo_id != "":
+		Game.ammo[ammo_id] = Game.ammo_reserve(ammo_id) + reserve
+		Game.ammo_changed.emit()
+	Game.add_loot_gun(id)                 # (emits loadout_changed)
+	if vehicle == null and _ragdoll == null and not _dead:
+		select_item(i)
+		_loadout_dirty = false
+	if Game.hud:
+		Game.hud.show_message("%s alındı  ·  tuş %s  ·  ganimet: ölünce gider" % [str(it.item_name),
+				Game.key_label(Game.gun_index(id))], 2.6)
+	if Game.sfx:
+		Game.sfx.play("grip", -6.0, 0.95)
+		Game.sfx.play("select", -10.0, 0.8)
+
+
 func _process(delta: float) -> void:
+	look_frame = _look_acc                   # (input runs before _process; the items process after us)
+	_look_acc = Vector2.ZERO
 	_rag_cooldown = maxf(_rag_cooldown - delta, 0.0)
+	if DownedView.active(self) and _ragdoll == null and vehicle == null:
+		DownedView.process(self, delta)      # downed / getting up: the low view, the pose, give up (downed_view.gd)
+		return
+	_tool_hold_tick()                          # Z held long enough: Hızlı siper (end of file)
 	_update_health(delta)
+	_wheel_t = maxf(_wheel_t - delta, 0.0)
+	WeaponDrop.local_tick(self, delta)       # guns on the ground: focus + F hold (clears itself off foot)
+	if _loadout_dirty and vehicle == null and _ragdoll == null and not _dead:
+		_fix_held()
 	if vehicle != null or _ragdoll != null:
 		# Shake that builds up while tumbling must not all fire on getting up.
 		_punch = _punch.lerp(Vector3.ZERO, 1.0 - exp(-9.0 * delta))
@@ -300,6 +558,9 @@ func _process(delta: float) -> void:
 		var tk := _trauma * _trauma * 0.045
 		crot += Vector3(sin(_trauma_t * 27.0) + sin(_trauma_t * 11.0) * 0.6, sin(_trauma_t * 23.0 + 1.7) + sin(_trauma_t * 9.0) * 0.6,
 				sin(_trauma_t * 19.0 + 0.6) * 0.6) * tk
+	crot += stance.cam_rot()                # slide: roll into the steer + ground rumble
+	crot += hit_fx.cam_rot(self, delta)     # a heavy hit's stumble (hit_reactor.gd PlayerFeel)
+	crot += mantle.cam_rot()                # a ledge climb: dip + roll toward the leading hand
 	if crot.length_squared() > 1e-10:
 		camera.rotation = crot
 	elif camera.rotation != Vector3.ZERO:
@@ -326,7 +587,7 @@ func _animate_body(delta: float) -> void:
 		"vel_local": b.inverse() * hv, "vel_up": velocity.dot(up), "yaw_rate": yaw_rate, "exclude": [get_rid()],
 		"jet_power": clampf(_jet_power * 1.3, 0.25, 1.0), "speed": hv.length(), "grounded": is_on_floor(),
 		"jetting": jetting, "zero_g": false, "pitch": _pitch, "holding": icon != "",
-		"two_hand": icon in TWO_HAND, "using": it.using,
+		"two_hand": icon in TWO_HAND, "using": it.using, "crouch": crouch_k, "slide": slide_k,
 	})
 	astronaut.set_lamp(_lamp_on, 1.0 if _lamp_on else 0.0)
 
@@ -337,10 +598,32 @@ func _on_item_raised(i: int) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	if vehicle == null and _ragdoll == null and not _dead:
-		for i in items.size():
-			if event.is_action_pressed("slot_%d" % (i + 1)):
-				select_item(i)
+	if vehicle == null and _ragdoll == null and not _dead and not DownedView.active(self):
+		# Quickbar: Z the drill, X the build tool (again: back to the last gun; Z held = Hızlı siper),
+		# 1, 2, 3 … 9, 0 the carried guns (Game.carried_guns()).
+		if _tool_key_input(event):
+			get_viewport().set_input_as_handled()
+			return
+		for n in range(Game.FIRST_GUN_KEY, 11):
+			if InputMap.has_action("slot_%d" % n) and event.is_action_pressed("slot_%d" % n):
+				select_slot(n - Game.FIRST_GUN_KEY)
+				get_viewport().set_input_as_handled()
+				return
+		# The wheel cycles the carried guns while one is held (down: next; the sniper's scope zoom
+		# takes it first; the drill and the build tool keep it for their brush / card).
+		if (event.is_action_pressed("brush_up") or event.is_action_pressed("brush_down")) \
+				and not Game.ui_panel_open() and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+			if _wheel_swap(1 if event.is_action_pressed("brush_down") else -1):
+				get_viewport().set_input_as_handled()
+				return
+		# Left-hand actions on foot (Q is the skiff's strafe while piloting: vehicle == null here).
+		if hand_action != null and not event.is_echo() and not Game.ui_panel_open():
+			if event.is_action_pressed("throw_grenade"):
+				hand_action.start_grenade()
+				get_viewport().set_input_as_handled()
+				return
+			if event.is_action_pressed("scan_pulse"):
+				hand_action.start_scan()
 				get_viewport().set_input_as_handled()
 				return
 	if event.is_action_pressed("interact"):
@@ -366,9 +649,19 @@ func _unhandled_input(event: InputEvent) -> void:
 		rotate_object_local(Vector3.UP, -lk.x * MOUSE_SENS * look_scale)
 		_pitch = clampf(_pitch - lk.y * MOUSE_SENS * look_scale, -1.5, 1.5)
 		head.rotation.x = _pitch
+		_look_acc += Vector2(-lk.y, -lk.x) * MOUSE_SENS * look_scale
 	elif event.is_action_pressed("flashlight"):
 		toggle_lamp()
 		get_viewport().set_input_as_handled()
+
+
+## Gun recoil turning the view itself (gun_feel.gd Climb): v.x pitch up, v.y yaw left (rad).
+func add_view_kick(v: Vector2) -> void:
+	if vehicle != null or _ragdoll != null or _dead:
+		return
+	rotate_object_local(Vector3.UP, v.y)
+	_pitch = clampf(_pitch + v.x, -1.5, 1.5)
+	head.rotation.x = _pitch
 
 
 ## Camera shake (0..1, accumulates up to 1), e.g. explosions by distance.
@@ -387,8 +680,13 @@ func _world_up(pos: Vector3) -> Vector3:
 func _physics_process(delta: float) -> void:
 	if vehicle != null or _ragdoll != null:
 		return
+	if preload("res://scripts/war/cave_in.gd").hold_player(self, delta):   # buried by a cave-in: held in the soil
+		return
 	if waiting_ground:
 		_wait_for_ground()
+		return
+	if DownedView.active(self):
+		DownedView.physics(self, delta)      # downed: the crawl / the drag; getting up: still (downed_view.gd)
 		return
 	# Something shoved us hard (blast, big hit impulse): tumble.
 	var shove := velocity - _last_vel
@@ -402,7 +700,7 @@ func _physics_process(delta: float) -> void:
 		# (Never happens on the planets; drift gently if it ever does.)
 		velocity *= 0.99
 		move_and_slide()
-	else:
+	elif not mantle.physics(delta):           # a ledge climb runs instead of the walk (scripts/player/mantle.gd)
 		_move_gravity(delta, g_len)
 	_last_vel = velocity
 	# Positions of the last two physics steps: the view is drawn between them (_update_head_bob).
@@ -440,44 +738,64 @@ func _move_gravity(delta: float, g_len: float) -> void:
 
 	var b := global_transform.basis
 	var inp := Input.get_vector("move_left", "move_right", "move_forward", "move_back")
-	if _dead:
+	if _dead or Game.ui_panel_open():          # (multiplayer: chat / menus do not pause the game)
 		inp = Vector2.ZERO
 	var wish := b.x * inp.x + b.z * inp.y
 	wish -= up * wish.dot(up)
 	var on_floor := is_on_floor()
-	# Sprint builds up: a short delay, then ~0.4 s to full speed; eases off when released. In the air
-	# it is kept as it was, so a hop does not cost the run-up.
-	var want_sprint := Input.is_action_pressed("sprint") and inp.y < -0.3 and move_speed_mult >= 0.9
+	stance.pre_move(delta, on_floor)          # crouch / slide input and state (scripts/player/stance.gd)
+	# Sprint builds up: a short delay, then SPRINT_RAMP s to full speed; eases off when released. In the
+	# air it is kept as it was, so a hop does not cost the run-up.
+	var want_sprint := Input.is_action_pressed("sprint") and inp.y < -0.3 and move_speed_mult >= 0.9 \
+			and not bool(stance.blocks_sprint())
 	if on_floor:
 		_sprint_hold = _sprint_hold + delta if want_sprint else 0.0
 		if want_sprint and _sprint_hold > 0.12:
-			_sprint_k = minf(_sprint_k + delta / 0.4, 1.0)
+			_sprint_k = minf(_sprint_k + delta / SPRINT_RAMP, 1.0)
 		else:
-			_sprint_k = maxf(_sprint_k - delta / 0.35, 0.0)
+			_sprint_k = maxf(_sprint_k - delta / SPRINT_EASE, 0.0)
 	elif not want_sprint:
-		_sprint_k = maxf(_sprint_k - delta / 0.35, 0.0)
-	var speed := lerpf(WALK, SPRINT, _sprint_k * _sprint_k * (3.0 - 2.0 * _sprint_k)) * move_speed_mult
+		_sprint_k = maxf(_sprint_k - delta / SPRINT_EASE, 0.0)
+	# The held gun's weight (its const WEIGHT, item.gd carry_weight: rocket 0.86 ... SMG 1.05), eased
+	# over ~0.3 s so a swap does not jerk the pace.
+	var cur_it = items[current_item] if current_item < items.size() else null
+	var w_target: float = float(cur_it.carry_weight()) if cur_it != null and cur_it.has_method("carry_weight") else 1.0
+	_weight = move_toward(_weight, w_target, delta * 0.6)
+	var speed := lerpf(WALK, SPRINT, _sprint_k * _sprint_k * (3.0 - 2.0 * _sprint_k)) * move_speed_mult \
+			* float(stance.speed_mult()) * _weight
+	speed = minf(speed, Downed.speed_cap(self))     # dragging a downed teammate / unsteady after a revive
 
 	var v_up := up * velocity.dot(up)
 	var v_h := velocity - v_up
-	# Suit: firm but not floaty acceleration, a bit firmer braking, little control in the air.
+	# Suit: weighty acceleration (momentum carries into a start, a stop and a turn), a bit firmer
+	# braking, little control in the air. A hard landing slows the next steps (_land_slow).
 	var target := wish * speed
-	var accel := 2.2
+	_land_slow_t = maxf(_land_slow_t - delta, 0.0)
+	if on_floor and _land_slow_t > 0.0:
+		target *= 1.0 - _land_slow * _land_slow_t / LAND_SLOW_T
+	var accel := AIR_ACCEL
 	if on_floor:
-		accel = 15.0 if target.length_squared() < 0.01 else 12.0
+		accel = DECEL if target.length_squared() < 0.01 else ACCEL
 		if target.length_squared() > 0.01 and v_h.dot(target) < 0.0:
-			accel = 16.0    # turning around: plant the feet
+			accel = TURN_DECEL    # turning around: plant the feet
 	elif v_h.dot(target) > 0.0:
 		# Air control steers but never brakes a running jump down to walking speed.
 		target = target.normalized() * maxf(target.length(), v_h.length())
-	v_h = v_h.move_toward(target, accel * delta)
+	target *= hit_fx.speed_mult() if on_floor else 1.0   # hit reactions: tagged, slowed a moment...
+	accel *= hit_fx.grip()                               # ...and a hit's knockback skids (PlayerFeel)
+	if stance.sliding:
+		v_h = stance.slide_step(v_h, up, wish, delta)
+	else:
+		v_h = v_h.move_toward(target, accel * delta)
 	v_up += gravity_vec * delta
 	# Forgiving jump: a little after running off an edge (coyote time), or pressed just before
 	# touching down (buffer); bumpy voxel ground makes is_on_floor() flicker.
 	_coyote = 0.12 if on_floor else maxf(_coyote - delta, 0.0)
-	_jump_buf = 0.12 if Input.is_action_just_pressed("jump") and not _dead else maxf(_jump_buf - delta, 0.0)
+	_jump_buf = 0.12 if Input.is_action_just_pressed("jump") and not _dead and not Game.ui_panel_open() else maxf(_jump_buf - delta, 0.0)
 	if _jump_buf > 0.0 and _coyote > 0.0 and v_up.dot(up) < JUMP * 0.5:
-		v_up = up * JUMP
+		stance.on_jump()                      # out of a slide (hop) / a crouch (stands up first)
+		v_h = stance.hop_cap(v_h)
+		v_up = up * JUMP * stance.jump_mult()
 		_jump_buf = 0.0
 		_coyote = 0.0
 		if Game.sfx:
@@ -487,7 +805,7 @@ func _move_gravity(delta: float, g_len: float) -> void:
 	# capped climb speed, thrust gone 20 m above the ground; refills slowly on the ground.
 	jetting = false
 	_jet_power = 0.0
-	if Input.is_action_pressed("jump") and not _dead:
+	if Input.is_action_pressed("jump") and not _dead and not Game.ui_panel_open():
 		_jump_hold += delta
 		if not on_floor and _jump_hold > 0.2 and jet_fuel > 0.0:
 			var k := _jet_ground_factor(up, delta)
@@ -535,14 +853,19 @@ func _footsteps(_delta: float, h_speed: float) -> void:
 		var k := clampf((_last_fall - 2.0) / 8.0, 0.0, 1.0)
 		if Game.sfx:
 			Game.sfx.play("step", lerpf(-16.0, -2.0, k), lerpf(0.9, 0.7, k))
-		_land_vel -= minf(_last_fall, 12.0) * 0.012
+		_land_vel -= minf(_last_fall, 12.0) * LAND_DIP
+		# A hard landing plants the feet: the next steps start slower (LAND_SLOW_*, _move_gravity).
+		var slow := LAND_SLOW * clampf((_last_fall - LAND_SLOW_V0) / (LAND_SLOW_V1 - LAND_SLOW_V0), 0.0, 1.0)
+		if slow > 0.0:
+			_land_slow = maxf(slow, _land_slow * _land_slow_t / LAND_SLOW_T)
+			_land_slow_t = LAND_SLOW_T
 		_last_fall = 0.0
-	if on_floor and h_speed > 1.0:
+	if on_floor and h_speed > 1.0 and stance.steps_on():
 		var half := floori(astronaut._phase * 2.0)
 		if half != _step_half:
 			_step_half = half
 			if Game.sfx:
-				Game.sfx.play("step", -14.0, randf_range(0.93, 1.07))
+				Game.sfx.play("step", -14.0 + stance.step_db(), randf_range(0.93, 1.07))
 	_was_on_floor = on_floor
 
 
@@ -579,7 +902,10 @@ func _update_interact() -> void:
 			target = col
 	interact_target = target
 	if Game.hud:
-		Game.hud.set_prompt(target.get_interact_prompt() if target != null and target.has_method("get_interact_prompt") else "")
+		var pr: String = target.get_interact_prompt() if target != null and target.has_method("get_interact_prompt") else ""
+		if target == null:
+			pr = WeaponDrop.prompt_text()        # a gun at our feet: "[F basılı tut] ... al"
+		Game.hud.set_prompt(pr)
 
 
 # ------------------------------------------------------------------------------------------
@@ -589,6 +915,8 @@ func _update_interact() -> void:
 func enter_vehicle(v) -> void:
 	vehicle = v
 	interact_target = null
+	if hand_action != null:
+		hand_action.cancel()
 	if Game.hud:
 		Game.hud.set_prompt("")
 	_col.disabled = true
@@ -641,13 +969,22 @@ func is_ragdolled() -> bool:
 	return _ragdoll != null
 
 
+## The left hand is throwing a grenade / using the wrist scanner, or the hands are on a ledge (a
+## mantle): the held item can't be used.
+func hands_busy() -> bool:
+	return (hand_action != null and hand_action.busy()) or (mantle != null and mantle.busy())
+
+
 ## Knocks the astronaut over: a physical ragdoll launched with the current velocity + `impulse`
 ## (a velocity change in m/s). Stays down at least `duration` s, then stands up where it landed
 ## (or, when dead, lies there until the respawn).
 func ragdoll(impulse: Vector3, duration := 2.5, exclude: Array = []) -> void:
-	if _ragdoll != null or vehicle != null:
+	if _ragdoll != null or vehicle != null or DownedView.active(self):
 		return
 	var vel := velocity + impulse
+	if hand_action != null:
+		hand_action.cancel()
+	stance.reset()                            # no crouch / slide (vehicles: stance.gd resets itself)
 	_ragdoll = Ragdoll.new()
 	get_parent().add_child(_ragdoll)
 	astronaut.set_first_person(false)
@@ -668,6 +1005,7 @@ func ragdoll(impulse: Vector3, duration := 2.5, exclude: Array = []) -> void:
 		Game.sfx.play("impact", lerpf(-12.0, -2.0, clampf(vel.length() / 25.0, 0.0, 1.0)), 0.9)
 	_lamp_local = flashlight.transform
 	_ragdoll.start(self, vel, duration, exclude)
+	hit_fx.on_ragdoll(self, _ragdoll, vel)    # hit reactions: a kick at the struck part, hit_reacted "knockdown"
 	if _dead:
 		_ragdoll.no_float_recover = true
 	_ragdoll.finished.connect(_end_ragdoll)
@@ -684,6 +1022,9 @@ func _follow_ragdoll() -> void:
 ## pointed, and hand the controls back. (Dead: stay down, the respawn timer takes over.)
 func _end_ragdoll(pos: Vector3, fwd: Vector3) -> void:
 	if _dead:
+		return
+	if Downed.is_downed(self):
+		DownedView.from_ragdoll(self, pos, fwd)   # knocked over and down: lie on where it settled (downed_view.gd)
 		return
 	var a = astronaut
 	# Capture the lying pose (bone locals; the hips in world space) before moving the body.
@@ -710,6 +1051,7 @@ func _end_ragdoll(pos: Vector3, fwd: Vector3) -> void:
 	camera.rotation = Vector3.ZERO
 	_getup_t = 0.0
 	_ragdoll.begin_getup(camera, GETUP_TIME)
+	hit_reacted.emit("getup", -z, GETUP_TIME, "")           # (hit reactions: multiplayer mirror)
 	if Game.sfx:
 		Game.sfx.play("servo", -14.0, 0.8)
 
@@ -800,14 +1142,14 @@ func _update_head_bob(delta: float) -> void:
 	var up := global_transform.basis.y
 	var hv := velocity - up * velocity.dot(up)
 	var moving: bool = is_on_floor() and hv.length() > 0.5
-	_bob_amt = move_toward(_bob_amt, clampf(hv.length() / SPRINT, 0.0, 1.0) if moving else 0.0, delta * 3.0)
+	_bob_amt = move_toward(_bob_amt, clampf(hv.length() / SPRINT, 0.0, 1.0) if moving else 0.0, delta * 2.5)
 	# On the body's gait clock: the head is lowest when a foot plants (phase 0 and 0.5).
 	var ph: float = astronaut._phase * TAU
-	var dip := -(0.5 + 0.5 * cos(2.0 * ph)) * 0.022 * _bob_amt
-	var sway := sin(ph) * 0.01 * _bob_amt
-	# Landing dip: a short spring.
-	_land_vel += (-_land_off * 120.0 - _land_vel * 15.0) * delta
-	_land_off = clampf(_land_off + _land_vel * delta, -0.14, 0.05)
+	var dip := -(0.5 + 0.5 * cos(2.0 * ph)) * BOB_DIP * _bob_amt
+	var sway := sin(ph) * BOB_SWAY * _bob_amt
+	# Landing dip: a spring (2026-10-06 tok: softer and deeper, 120 / 15 / -0.14 -> 90 / 13 / -0.18).
+	_land_vel += (-_land_off * 90.0 - _land_vel * 13.0) * delta
+	_land_off = clampf(_land_off + _land_vel * delta, -0.18, 0.05)
 	# Physics steps at 60 Hz: on faster screens draw the view between the last two physics
 	# positions (at most one tick behind) instead of letting it step.
 	var moved := global_position - _phys_cur
@@ -815,7 +1157,9 @@ func _update_head_bob(delta: float) -> void:
 		_phys_prev += moved
 		_phys_cur += moved
 	var lag := _phys_prev.lerp(_phys_cur, Engine.get_physics_interpolation_fraction()) - global_position
-	head.position = Vector3(sway, 1.6 + dip + _land_off, 0.0) + global_transform.basis.inverse() * lag
+	# Crouch / slide: a lower eye and a smaller bob (scripts/player/stance.gd).
+	var bm: float = stance.bob_mult()
+	head.position = Vector3(sway * bm, EYE_H + dip * bm + _land_off - stance.eye_drop(), 0.0) + global_transform.basis.inverse() * lag
 
 
 # ------------------------------------------------------------------------------------------
@@ -947,11 +1291,28 @@ func is_dead() -> bool:
 func take_damage(amount: float, from_pos := Vector3.ZERO, impulse := Vector3.ZERO) -> Dictionary:
 	if _dead or amount <= 0.0:
 		return {"dmg": 0.0, "killed": false}
+	if Game.has_meta("training_god"):           # Eğitim Alanı ölümsüzlük (scripts/training/training.gd)
+		amount = minf(amount, maxf(hp - 1.0, 0.0))
 	# Inside a vehicle with a hull (the shuttle): it takes the hits instead.
-	if vehicle != null and vehicle.has_method("shield_pilot"):
+	if vehicle != null and vehicle.has_method("shield_pilot") and not _net_auth:
 		amount = float(vehicle.shield_pilot(amount, from_pos))
 		if amount <= 0.0:
 			return {"dmg": 0.0, "killed": false}
+	# A relic's Kalkan (scripts/war/cache_buffs.gd absorb) eats what it can.
+	if has_meta("dmg_absorb") and not _net_auth and is_instance_valid(get_meta("dmg_absorb")):
+		amount = float(get_meta("dmg_absorb").absorb(amount, from_pos))
+		if amount <= 0.0:
+			return {"dmg": 0.0, "killed": false}
+	if Net.is_client() and not _net_auth:
+		# Multiplayer client: the host owns our hp; our own falls / crashes go there as a claim and
+		# come back as net_hurt() (scripts/net/net_players.gd).
+		Net.players.claim_self_damage(amount, from_pos, impulse)
+		return {"dmg": amount, "killed": false}
+	if Downed.is_downed(self):               # down: the hit drains the bleed-out (scripts/war/downed.gd)
+		if Game.hud and Game.hud.has_method("on_player_damaged"):
+			Game.hud.on_player_damaged(amount, from_pos)
+		return Downed.hurt_downed(self, amount, from_pos, impulse)
+	var hp0 := hp
 	hp = maxf(hp - amount, 0.0)
 	_since_hit = 0.0
 	var k := clampf(amount / 30.0, 0.15, 1.0)
@@ -966,10 +1327,30 @@ func take_damage(amount: float, from_pos := Vector3.ZERO, impulse := Vector3.ZER
 		Game.hud.on_player_damaged(amount, from_pos)
 	if impulse != Vector3.ZERO and _ragdoll == null and vehicle == null:
 		velocity += impulse
+	hit_fx.on_hit(self, amount, from_pos, impulse)   # aim punch, knockback kick, tagging, jolt, stumble (hit_reactor.gd)
 	if hp <= 0.0:
+		if _net_auth and Downed.client_lethal(self):          # multiplayer client: the host's verdict decides
+			return {"dmg": amount, "killed": false}
+		if not _net_auth and Downed.try_down(self, amount, from_pos, impulse, hp0):
+			return {"dmg": amount, "killed": false, "downed": true}   # down, not dead (downed_view.gd)
 		_die(impulse)
 		return {"dmg": amount, "killed": true}
 	return {"dmg": amount, "killed": false}
+
+
+## Multiplayer client: a hit the host decided (it owns our hp): the usual feel, then the host's hp;
+## death when it says so.
+func net_hurt(amount: float, from_pos: Vector3, impulse: Vector3, new_hp: float) -> void:
+	if _dead:
+		return
+	_net_auth = true
+	hp = new_hp + amount
+	take_damage(amount, from_pos, impulse)
+	_net_auth = false
+	if not _dead:
+		hp = clampf(new_hp, 0.0, hp_max)
+		if hp <= 0.0 and not Downed.is_downed(self) and not Downed.client_lethal(self):
+			_die(impulse)
 
 
 func heal(amount: float) -> void:
@@ -978,7 +1359,7 @@ func heal(amount: float) -> void:
 
 
 func _update_health(delta: float) -> void:
-	if _dead:
+	if _dead or Downed.is_downed(self):
 		return
 	_since_hit += delta
 	if _since_hit > REGEN_DELAY and hp < hp_max:
@@ -993,12 +1374,22 @@ func _die(impulse := Vector3.ZERO) -> void:
 	_dead = true
 	if Game.hud:
 		Game.hud.show_message("Öldün — yeniden doğuluyor…", RESPAWN_DELAY)
+	var seated := vehicle != null
 	if vehicle != null:
 		exit_vehicle()
+	# What dying costs, in one place (loot.gd on_player_death): the material share and every carried
+	# loot gun drop here, the gun in hand drops a copy, then the loot guns are gone.
+	preload("res://scripts/war/loot.gd").on_player_death(self)
 	if _ragdoll == null:
-		ragdoll(impulse, 60.0)
+		# take_damage already put the killing hit's impulse into the velocity (not while seated): count it
+		# once, and cap the launch like a bot's corpse (2026-10-06 tok: a rocket kill threw the body at
+		# ~21 m/s, the impulse twice; now <= HR_CORPSE_MAX along the ground, HR_CORPSE_UP_MAX up).
+		velocity = _corpse_launch(velocity + (impulse if seated else Vector3.ZERO))
+		ragdoll(Vector3.ZERO, 60.0)
 	elif _ragdoll != null:
 		_ragdoll.no_float_recover = true
+	if preload("res://scripts/war/respawn_ship.gd").player_died(self):   # dropship respawn: it calls _respawn() at Balance.RESPAWN_TIME
+		return
 	await get_tree().create_timer(RESPAWN_DELAY).timeout
 	if not is_inside_tree():
 		return
@@ -1009,7 +1400,17 @@ func _die(impulse := Vector3.ZERO) -> void:
 		Game.hud.fade_from_black(0.8)
 
 
+## The death ragdoll's launch: `v` with its part along the ground capped at Balance.HR_CORPSE_MAX and
+## the upward part at HR_CORPSE_UP_MAX (hit_reactor.gd _cap_v, the bots' corpses; 2026-10-06 tok).
+func _corpse_launch(v: Vector3) -> Vector3:
+	var bal := preload("res://scripts/war/balance.gd")
+	var up := _world_up(global_position)
+	var vu := v.dot(up)
+	return (v - up * vu).limit_length(bal.HR_CORPSE_MAX) + up * minf(vu, bal.HR_CORPSE_UP_MAX)
+
+
 func _respawn() -> void:
+	_ragdoll = preload("res://scripts/war/corpse.gd").leave(astronaut, _ragdoll, "home", "player")   # corpses: the body stays
 	if _ragdoll != null:
 		_ragdoll.queue_free()
 		_ragdoll = null
@@ -1023,8 +1424,10 @@ func _respawn() -> void:
 	for it in items:
 		it.set_active(true)
 		it.set_equipped(false)
+	_fix_held(false)                         # the item held last (a lost loot gun: the first gun, else the drill)
 	_pending_equip = current_item
 	viewmodel.swap_to(items[current_item], Callable())
+	Game.loadout_changed.emit()              # (re-equipped: the quickbar, the view model, multiplayer)
 	hp = hp_max
 	jet_fuel = JET_FUEL
 	_since_hit = 99.0
@@ -1033,3 +1436,73 @@ func _respawn() -> void:
 	camera.current = true
 	Game.controlled = self
 	spawn(Game.planet)
+
+
+# =================================================================================================
+# Tool keys (2026-10-06, the user: "matkap ve inşaatı silah tuşlarına koyma, kafa karıştırıyor"):
+# the guns keep the number row (1, 2, 3 … Game.FIRST_GUN_KEY), the tools sit on Z / X (game.gd
+# "tool_drill" / "tool_build"). Z tapped: the drill (again: back to the last gun), on release so a
+# hold can be told apart; Z held TOOL_HOLD_MS: Hızlı siper (scripts/player/entrench.gd start()),
+# the item in hand stays. X: the build tool (again: back to the last gun); Ctrl+X is the build tool's
+# own "hold to sell" and is left to it.
+# =================================================================================================
+
+const TOOL_HOLD_MS := 350
+
+var _entrench = null                       # entrench.gd (child, built in _ready)
+var _z_down_ms := -1
+var _z_held_done := false
+
+
+## Z / X in _unhandled_input (on foot, controls ours). True when the event was a tool key.
+func _tool_key_input(event: InputEvent) -> bool:
+	if event.is_action_pressed("tool_drill") and not event.is_echo():
+		_z_down_ms = Time.get_ticks_msec()
+		_z_held_done = false
+		return true
+	if event.is_action_released("tool_drill"):
+		var tapped := _z_down_ms >= 0 and not _z_held_done
+		_z_down_ms = -1
+		if tapped and not Game.ui_panel_open():
+			_toggle_tool("terrain")
+		return true
+	if event.is_action_pressed("tool_build") and not event.is_echo():
+		if event is InputEventKey and ((event as InputEventKey).ctrl_pressed or Input.is_key_pressed(KEY_CTRL)):
+			return false                       # Ctrl+X: the build tool's sell
+		if not Game.ui_panel_open():
+			_toggle_tool("build")
+		return true
+	return false
+
+
+## Every frame: Z still down after TOOL_HOLD_MS -> the quick foxhole (once per press).
+func _tool_hold_tick() -> void:
+	if _z_down_ms < 0 or _z_held_done:
+		return
+	if vehicle != null or _dead or _ragdoll != null or not Input.is_action_pressed("tool_drill"):
+		_z_down_ms = -1
+		return
+	if Time.get_ticks_msec() - _z_down_ms < TOOL_HOLD_MS:
+		return
+	_z_held_done = true
+	if _entrench != null and is_instance_valid(_entrench) and not Game.ui_panel_open() \
+			and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+		_entrench.start()
+
+
+## Takes tool `id` ("terrain" / "build") up, or, already holding it, goes back to the last gun
+## (else the first carried one; with no gun it stays).
+func _toggle_tool(id: String) -> void:
+	var cur = items[current_item] if current_item >= 0 and current_item < items.size() else null
+	if cur != null and str(cur.item_id) == id:
+		var g := _last_gun if _last_gun != "" and Game.can_hold(_last_gun) else ""
+		if g == "":
+			var cg: Array = Game.carried_guns()
+			g = str(cg[0]) if not cg.is_empty() else ""
+		var gi := item_index(g) if g != "" else -1
+		if gi >= 0:
+			select_item(gi)
+		return
+	var i := item_index(id)
+	if i >= 0:
+		select_item(i)

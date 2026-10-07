@@ -33,7 +33,19 @@ func _ready() -> void:
 	_sfx = AudioStreamPlayer.new()
 	_sfx.process_mode = Node.PROCESS_MODE_ALWAYS
 	add_child(_sfx)
+	get_viewport().size_changed.connect(_fit)
+	_fit()
 
+
+## Laid out at 1080p and scaled with the window height (the design system's rule): the root is
+## sized to the window / k and scaled by k.
+func _fit() -> void:
+	var vs := get_viewport().get_visible_rect().size
+	var k := clampf(vs.y / 1080.0, 0.75, 2.0)
+	_root.set_anchors_preset(Control.PRESET_TOP_LEFT)
+	_root.position = Vector2.ZERO
+	_root.size = vs / k
+	_root.scale = Vector2(k, k)
 
 func _build_menu() -> void:
 	_menu = Control.new()
@@ -46,8 +58,8 @@ func _build_menu() -> void:
 	hb.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	hb.offset_left = 74
 	var line := ColorRect.new()
-	line.color = Color(UI.CYAN.r, UI.CYAN.g, UI.CYAN.b, 0.45)
-	line.custom_minimum_size = Vector2(2, 360)
+	line.color = Color(UI.SUIT_ORANGE, 0.85)                  # the suit's band (scripts/ui/ui_style.gd)
+	line.custom_minimum_size = Vector2(3, 360)
 	line.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	line.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hb.add_child(line)
@@ -55,8 +67,10 @@ func _build_menu() -> void:
 	col.alignment = BoxContainer.ALIGNMENT_CENTER
 	col.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	col.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	Kit.heading(col, "DURAKLATILDI", 13, UI.CYAN, 4)
-	Kit.heading(col, "UZAY SINIRI", 50, UI.TEXT, 3)
+	Kit.heading(col, "OYUN SÜRÜYOR · ÇOK OYUNCULU" if Net.active else "DURAKLATILDI", 13, UI.CYAN, 4)
+	var title := Kit.heading(col, "UZAY SINIRI", 52, UI.SUIT_WHITE, 6)
+	title.add_theme_constant_override("outline_size", 6)
+	title.add_theme_color_override("font_outline_color", UI.OUTLINE)
 	UI.label(col, "İki gezegen, bir kazı aracı ve rakip.", 15, UI.DIM)
 	var gap := Control.new()
 	gap.custom_minimum_size.y = 26
@@ -65,6 +79,10 @@ func _build_menu() -> void:
 	_buttons = UI.vbox(col, 8)
 	Kit.menu_button(_buttons, "Devam", "Esc").pressed.connect(close)
 	Kit.menu_button(_buttons, "Ayarlar", "", "Fare, görüş alanı, ses, ekran").pressed.connect(_open_settings)
+	if Net.active:
+		Kit.menu_button(_buttons, "Odadan Ayrıl", "", "Ana menüye dön (oyun durmaz)", 380.0, true).pressed.connect(_leave_room)
+	if Game.has_meta("training"):
+		Kit.menu_button(_buttons, "Ana Menü", "", "Eğitim alanından çık", 380.0, true).pressed.connect(_training_exit)
 	Kit.menu_button(_buttons, "Çıkış", "", "Masaüstüne dön", 380.0, true).pressed.connect(_quit)
 	var gap2 := Control.new()
 	gap2.custom_minimum_size.y = 18
@@ -84,7 +102,7 @@ func is_open() -> bool:
 func open() -> void:
 	if _root.visible:
 		return
-	get_tree().paused = true
+	get_tree().paused = not Net.active          # multiplayer: the world keeps running
 	Input.mouse_mode = Input.MOUSE_MODE_VISIBLE
 	_root.visible = true
 	_menu.visible = true
@@ -130,7 +148,10 @@ func _on_settings_closed() -> void:
 
 func _quit() -> void:
 	get_tree().paused = false
-	get_tree().quit()
+	if Net.active:
+		Net.quit_game()          # tells the other player first
+	else:
+		get_tree().quit()
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -152,3 +173,17 @@ func _ui_sound(name: String, db := -12.0) -> void:
 	_sfx.stream = s
 	_sfx.volume_db = db
 	_sfx.play()
+
+
+## Eğitim Alanı: back to the main menu (scripts/training/training.gd to_menu).
+func _training_exit() -> void:
+	_root.visible = false
+	var tr = get_tree().get_first_node_in_group("training")
+	if tr != null and tr.has_method("to_menu"):
+		tr.to_menu()
+
+
+## Multiplayer: leave the room (back to the main menu).
+func _leave_room() -> void:
+	_root.visible = false
+	Net.leave("")

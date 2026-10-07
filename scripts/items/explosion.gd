@@ -14,6 +14,8 @@ const HitFeel := preload("res://scripts/items/hit_feel.gd")
 const ArsenalAudio := preload("res://scripts/items/arsenal_audio.gd")
 const Snd := preload("res://scripts/audio/snd_lib.gd")
 const Bodies := preload("res://scripts/planet/bodies.gd")
+const Balance := preload("res://scripts/war/balance.gd")      # BLAST_RADIUS_SCALE, CRATER_SCALE
+const BaseKit := preload("res://scripts/war/base_kit.gd")     # blast shelter of structures under soil
 
 const LIFE := 7.0
 const DECAL_LIFE := 40.0
@@ -28,7 +30,10 @@ static var _boom_task := -1
 static var _boom_mutex := Mutex.new()
 static var _boom_pending := {}
 
-var radius := 5.0
+var radius := 5.0                # damage radius (cfg radius × Balance.BLAST_RADIUS_SCALE)
+var fxr := 5.0                   # size of the show (cfg radius × Balance.CRATER_SCALE^0.75, see spawn)
+var _speed_k := minf(sqrt(Balance.CRATER_SCALE), 1.4)   # debris / spark speed (1.0 at CRATER_SCALE 1)
+const FX_DEBRIS_MAX := 28
 var damage := 140.0
 var impulse := 14.0
 var self_mult := 0.5
@@ -55,7 +60,8 @@ var _sounds: Array = []          # [delay, player]
 static func spawn(pos: Vector3, n: Vector3, cfg := {}) -> Node3D:
 	var tree := Engine.get_main_loop() as SceneTree
 	var e: Node3D = load("res://scripts/items/explosion.gd").new()
-	e.radius = float(cfg.get("radius", 5.0))
+	e.radius = float(cfg.get("radius", 5.0)) * Balance.BLAST_RADIUS_SCALE
+	e.fxr = float(cfg.get("radius", 5.0)) * pow(Balance.CRATER_SCALE, 0.75)
 	e.damage = float(cfg.get("damage", 140.0))
 	e.impulse = float(cfg.get("impulse", 14.0))
 	e.self_mult = float(cfg.get("self_mult", 0.5))
@@ -80,6 +86,7 @@ static func _up_at(pos: Vector3) -> Vector3:
 
 ## Builds the synthesized boom layers on a worker thread (call early to avoid a hitch).
 static func prewarm() -> void:
+	_warm_fx()                         # textures + shader variants at load, not in the first blast's frame
 	if _boom_task >= 0 or not _boom_streams.is_empty():
 		return
 	_boom_task = WorkerThreadPool.add_task(_build_booms, false, "explosion_audio")
@@ -87,7 +94,8 @@ static func prewarm() -> void:
 
 static func _build_booms() -> void:
 	var gen := ArsenalAudio.new()
-	var out := {"boom": gen.make("boom"), "boom_far": gen.make("boom_far"), "bounce": gen.make("bounce")}
+	var out := {"boom": gen.make("boom"), "boom_far": gen.make("boom_far"), "bounce": gen.make("bounce"),
+			"sub": gen._wav(gen._boom(1.6, false), 0.98)}     # always the synthesized body ("boom" may be recorded)
 	_boom_mutex.lock()
 	_boom_pending = out
 	_boom_mutex.unlock()
@@ -124,7 +132,9 @@ func _apply_damage(pos: Vector3) -> void:
 	var hf = HitFeel.inst() if player_owned else null
 	var first := true
 	var pl = Game.player
-	for n in get_tree().get_nodes_in_group(Game.DAMAGEABLE):
+	# Multiplayer client: explosions are only the look; the host's copy does the damage.
+	var targets: Array = [] if Net.is_client() else get_tree().get_nodes_in_group(Game.DAMAGEABLE)
+	for n in targets:
 		if not (n is Node3D) or not n.has_method("take_damage"):
 			continue
 		if n.has_method("is_dead") and n.is_dead():
@@ -136,6 +146,13 @@ func _apply_damage(pos: Vector3) -> void:
 			continue
 		var f := 1.0 - d / rr
 		f = f * f * 0.55 + f * 0.45
+		# Structures behind / under soil are sheltered by it (scripts/war/base_kit.gd blast_shelter;
+		# the soil this blast is about to blow away does not count). Bots / players: unchanged.
+		if n.is_in_group("war_structure") and not n.is_in_group("skiff"):
+			var bite := maxf(crater * Balance.CRATER_SCALE, radius * Balance.SHELTER_BITE_K)
+			f *= BaseKit.blast_shelter(n, pos, bite, normal)
+			if f <= 0.001:
+				continue
 		var dir := ((c - pos).normalized() + _up_at(c) * 0.6).normalized()
 		var mult := self_mult if (n == pl and player_owned) else 1.0
 		var dmg := damage * f * mult
@@ -162,7 +179,7 @@ func _apply_damage(pos: Vector3) -> void:
 	# Camera shake by distance.
 	if pl != null and is_instance_valid(pl) and pl.has_method("add_trauma"):
 		var dp := pos.distance_to(pl.global_position)
-		var shake := clampf(1.0 - dp / (radius * 9.0), 0.0, 1.0)
+		var shake := clampf(1.0 - dp / minf(fxr * 9.0, 150.0), 0.0, 1.0)
 		if shake > 0.0:
 			pl.add_trauma(0.25 + shake * shake * 0.75)
 
@@ -170,7 +187,7 @@ func _apply_damage(pos: Vector3) -> void:
 ## A crater in the planet under the blast (planet.gd crater(): carved over a few frames, radius
 ## capped at CRATER_MAX_R). `crater` is its radius in m; 0 = none.
 func _dig(pos: Vector3) -> void:
-	if crater <= 0.0:
+	if crater <= 0.0 or Net.is_client():
 		return
 	var body = Bodies.nearest(pos)
 	if body != null and body.has_method("crater"):
@@ -187,7 +204,7 @@ func _build_fx(pos: Vector3) -> void:
 	# Light flash.
 	_light = OmniLight3D.new()
 	_light.light_color = Color(1.0, 0.62, 0.3)
-	_light.omni_range = radius * 6.0
+	_light.omni_range = minf(fxr * 6.0, 70.0)
 	_light.light_energy = 18.0
 	_light.shadow_enabled = false
 	_light.position = normal * 1.2
@@ -220,31 +237,8 @@ func _build_fx(pos: Vector3) -> void:
 	_ring.scale = Vector3.ONE * 0.2
 	add_child(_ring)
 	var g := Game.gravity_at(pos)
-	# Fireball: hot additive core puffs, then dark billows that the fire leaves behind.
-	_particles({"amount": 36, "life": 0.95, "shape_r": radius * 0.14, "vmin": 1.5, "vmax": radius * 1.5,
-			"damp": 5.5, "spread": 180.0, "dir": normal, "size": radius * 0.5, "scale": [0.6, 1.5, 2.2],
-			"ramp": [[0.0, Color(1, 1, 0.92, 1)], [0.12, Color(1.0, 0.82, 0.4, 1)], [0.35, Color(1.0, 0.45, 0.12, 0.95)],
-				[0.65, Color(0.45, 0.14, 0.04, 0.6)], [1.0, Color(0.1, 0.08, 0.07, 0)]],
-			"add": true, "gravity": -g * 0.2, "pos": normal * 0.7})
-	_particles({"amount": 16, "life": 2.4, "shape_r": radius * 0.2, "vmin": 1.0, "vmax": radius * 0.9,
-			"damp": 3.0, "spread": 120.0, "dir": normal, "size": radius * 0.55, "scale": [0.5, 1.4, 2.0], "explosive": 0.9,
-			"ramp": [[0.0, Color(0.12, 0.1, 0.09, 0)], [0.12, Color(0.14, 0.12, 0.11, 0.85)], [0.6, Color(0.24, 0.23, 0.22, 0.55)],
-				[1.0, Color(0.3, 0.3, 0.3, 0)]], "lit": true, "gravity": -g * 0.12, "pos": normal * 0.9})
-	# Sparks.
-	_particles({"amount": 44, "life": 0.9, "shape_r": 0.2, "vmin": 8.0, "vmax": 24.0, "damp": 1.5, "spread": 75.0,
-			"dir": normal, "size": 0.0, "streak": true, "gravity": g * 0.8,
-			"ramp": [[0.0, Color(1, 0.95, 0.7, 1)], [0.6, Color(1.0, 0.55, 0.2, 1)], [1.0, Color(0.8, 0.2, 0.05, 0)]],
-			"add": true, "pos": normal * 0.4, "color_mult": 3.0})
-	# Rising smoke column.
-	_particles({"amount": 24, "life": 5.0, "shape_r": radius * 0.25, "vmin": 1.2, "vmax": 4.0, "damp": 1.2,
-			"spread": 40.0, "dir": normal, "size": radius * 0.6, "scale": [0.6, 2.2, 3.6], "explosive": 0.75,
-			"ramp": [[0.0, Color(0.3, 0.28, 0.26, 0)], [0.08, Color(0.32, 0.3, 0.28, 0.8)], [0.5, Color(0.48, 0.47, 0.46, 0.5)],
-				[1.0, Color(0.55, 0.55, 0.55, 0)]], "lit": true, "gravity": -g * 0.06, "pos": normal * 0.8})
-	# Dust ring sweeping outward along the ground.
-	_particles({"amount": 26, "life": 1.6, "shape_r": radius * 0.25, "ring": true, "vmin": radius * 1.2, "vmax": radius * 2.2,
-			"damp": 5.0, "spread": 12.0, "dir": normal, "size": radius * 0.35, "scale": [0.5, 1.5, 2.2], "radial": true,
-			"ramp": [[0.0, Color(ground, 0)], [0.1, Color(ground, 0.7)], [1.0, Color(ground.lightened(0.15), 0)]],
-			"lit": true, "gravity": g * 0.05, "pos": normal * 0.25})
+	for o in _fx_configs(fxr, g, normal, ground, _speed_k):
+		_particles(o)
 	# Debris chunks (CPU, they bounce on the ground).
 	var bm := BoxMesh.new()
 	bm.size = Vector3(0.12, 0.09, 0.14)
@@ -258,7 +252,7 @@ func _build_fx(pos: Vector3) -> void:
 	hot.emission_energy_multiplier = 2.5
 	var t1 := basis_n.x
 	var t2 := basis_n.z
-	for i in 12:
+	for i in mini(int(12.0 * pow(Balance.CRATER_SCALE, 0.75)), FX_DEBRIS_MAX):
 		var mi := MeshInstance3D.new()
 		mi.mesh = bm
 		mi.material_override = hot if i % 4 == 0 else dm
@@ -266,7 +260,7 @@ func _build_fx(pos: Vector3) -> void:
 		add_child(mi)
 		var a := randf() * TAU
 		var side := (t1 * cos(a) + t2 * sin(a)) * randf_range(0.3, 1.0)
-		var v := (normal * randf_range(0.8, 1.6) + side).normalized() * randf_range(6.0, 15.0)
+		var v := (normal * randf_range(0.8, 1.6) + side).normalized() * randf_range(6.0, 15.0) * _speed_k
 		var s := randf_range(0.5, 1.5)
 		mi.global_transform = Transform3D(Basis().scaled(Vector3.ONE * s), global_position + normal * 0.3 + side * 0.3)
 		_debris.append({"mi": mi, "vel": v, "spin": Vector3(randf_range(-12, 12), randf_range(-12, 12), randf_range(-12, 12)),
@@ -275,7 +269,7 @@ func _build_fx(pos: Vector3) -> void:
 	_decal = Decal.new()
 	_decal.texture_albedo = _tex_scorch
 	_decal.modulate = Color(0.05, 0.04, 0.035, 0.92)
-	_decal.size = Vector3(radius * 1.15, 0.9, radius * 1.15)
+	_decal.size = Vector3(fxr * 1.15, 0.9, fxr * 1.15)
 	_decal.upper_fade = 0.3
 	_decal.lower_fade = 0.3
 	_decal.normal_fade = 0.55
@@ -291,8 +285,20 @@ func _particles(o: Dictionary) -> GPUParticles3D:
 	e.explosiveness = float(o.get("explosive", 0.97))
 	e.randomness = 0.4
 	e.local_coords = false
-	e.visibility_aabb = AABB(Vector3.ONE * -radius * 6.0, Vector3.ONE * radius * 12.0)
+	e.visibility_aabb = AABB(Vector3.ONE * -fxr * 6.0, Vector3.ONE * fxr * 12.0)
 	e.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	var m := _fx_mats(o)
+	e.process_material = m[0]
+	e.draw_pass_1 = m[1]
+	add_child(e)
+	e.position = o.get("pos", Vector3.ZERO)
+	e.emitting = true
+	return e
+
+
+## One particle layer's process material and draw mesh (static: prewarm builds them at load).
+static func _fx_mats(o: Dictionary) -> Array:
+	var draw: Mesh = null
 	var pm := ParticleProcessMaterial.new()
 	var dir: Vector3 = o["dir"]
 	pm.direction = dir
@@ -353,7 +359,7 @@ func _particles(o: Dictionary) -> GPUParticles3D:
 		var qs := QuadMesh.new()
 		qs.size = Vector2(0.03, 0.32)
 		qs.material = mat
-		e.draw_pass_1 = qs
+		draw = qs
 	else:
 		mat.billboard_mode = BaseMaterial3D.BILLBOARD_PARTICLES
 		mat.albedo_texture = _tex_soft
@@ -366,15 +372,65 @@ func _particles(o: Dictionary) -> GPUParticles3D:
 		var q := QuadMesh.new()
 		q.size = Vector2.ONE * float(o["size"])
 		q.material = mat
-		e.draw_pass_1 = q
-	e.process_material = pm
-	add_child(e)
-	e.position = o.get("pos", Vector3.ZERO)
-	e.emitting = true
-	return e
+		draw = q
+	return [pm, draw, mat]
 
 
-func _add_mat(col: Color, energy: float) -> StandardMaterial3D:
+## The particle layers of a blast of show size `fx` (fireball, billows, sparks, smoke column, dust
+## ring); g = gravity there, n = the surface normal, soil = the ground colour.
+static func _fx_configs(fx: float, g: Vector3, n: Vector3, soil: Color, speed_k: float) -> Array:
+	return [
+		# Fireball: hot additive core puffs, then dark billows that the fire leaves behind.
+		{"amount": 36, "life": 0.95, "shape_r": fx * 0.14, "vmin": 1.5, "vmax": fx * 1.5,
+			"damp": 5.5, "spread": 180.0, "dir": n, "size": fx * 0.5, "scale": [0.6, 1.5, 2.2],
+			"ramp": [[0.0, Color(1, 1, 0.92, 1)], [0.12, Color(1.0, 0.82, 0.4, 1)], [0.35, Color(1.0, 0.45, 0.12, 0.95)],
+				[0.65, Color(0.45, 0.14, 0.04, 0.6)], [1.0, Color(0.1, 0.08, 0.07, 0)]],
+			"add": true, "gravity": -g * 0.2, "pos": n * 0.7},
+		{"amount": 16, "life": 2.4, "shape_r": fx * 0.2, "vmin": 1.0, "vmax": fx * 0.9,
+			"damp": 3.0, "spread": 120.0, "dir": n, "size": fx * 0.55, "scale": [0.5, 1.4, 2.0], "explosive": 0.9,
+			"ramp": [[0.0, Color(0.12, 0.1, 0.09, 0)], [0.12, Color(0.14, 0.12, 0.11, 0.85)], [0.6, Color(0.24, 0.23, 0.22, 0.55)],
+				[1.0, Color(0.3, 0.3, 0.3, 0)]], "lit": true, "gravity": -g * 0.12, "pos": n * 0.9},
+		# Sparks.
+		{"amount": 44, "life": 0.9, "shape_r": 0.2, "vmin": 8.0 * speed_k, "vmax": 24.0 * speed_k, "damp": 1.5, "spread": 75.0,
+			"dir": n, "size": 0.0, "streak": true, "gravity": g * 0.8,
+			"ramp": [[0.0, Color(1, 0.95, 0.7, 1)], [0.6, Color(1.0, 0.55, 0.2, 1)], [1.0, Color(0.8, 0.2, 0.05, 0)]],
+			"add": true, "pos": n * 0.4, "color_mult": 3.0},
+		# Rising smoke column.
+		{"amount": 24, "life": 5.0, "shape_r": fx * 0.25, "vmin": 1.2, "vmax": 4.0, "damp": 1.2,
+			"spread": 40.0, "dir": n, "size": fx * 0.6, "scale": [0.6, 2.2, 3.6], "explosive": 0.75,
+			"ramp": [[0.0, Color(0.3, 0.28, 0.26, 0)], [0.08, Color(0.32, 0.3, 0.28, 0.8)], [0.5, Color(0.48, 0.47, 0.46, 0.5)],
+				[1.0, Color(0.55, 0.55, 0.55, 0)]], "lit": true, "gravity": -g * 0.06, "pos": n * 0.8},
+		# Dust ring sweeping outward along the ground.
+		{"amount": 26, "life": 1.6, "shape_r": fx * 0.25, "ring": true, "vmin": fx * 1.2, "vmax": fx * 2.2,
+			"damp": 5.0, "spread": 12.0, "dir": n, "size": fx * 0.35, "scale": [0.5, 1.5, 2.2], "radial": true,
+			"ramp": [[0.0, Color(soil, 0)], [0.1, Color(soil, 0.7)], [1.0, Color(soil.lightened(0.15), 0)]],
+			"lit": true, "gravity": g * 0.05, "pos": n * 0.25},
+	]
+
+
+## Perf pass 2026-10-07: the first blast of a session used to build the scorch / glow textures (a
+## 128² noise image in GDScript) and generate + compile the particle and material shaders in its own
+## frame (~20 ms; later blasts ~3 ms). prewarm() now does that at load, and these materials stay
+## referenced for the whole session, so the shared shader variants never get freed between blasts
+## (a blast's own materials die with it after DECAL_LIFE s).
+static var _warm: Array = []
+
+
+static func _warm_fx() -> void:
+	if not _warm.is_empty():
+		return
+	_ensure_textures()
+	for o in _fx_configs(1.0, Vector3.DOWN, Vector3.UP, Color(0.42, 0.36, 0.27), 1.0):
+		_warm.append_array(_fx_mats(o))
+	_warm.append(_add_mat(Color(1.0, 0.82, 0.5, 1.0), 4.0))
+	var dm := StandardMaterial3D.new()
+	dm.roughness = 0.95
+	var hot := StandardMaterial3D.new()
+	hot.emission_enabled = true
+	_warm.append_array([dm, hot])
+
+
+static func _add_mat(col: Color, energy: float) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
@@ -396,16 +452,18 @@ func _process(delta: float) -> void:
 		_light.visible = k > 0.0
 	if _core != null:
 		var u := clampf(t / 0.12, 0.0, 1.0)
-		_core.scale = Vector3.ONE * lerpf(0.3, radius * 0.32, sqrt(u))
+		_core.scale = Vector3.ONE * lerpf(0.3, fxr * 0.32, sqrt(u))
 		_core_mat.albedo_color.a = (1.0 - u) * (1.0 - u)
 		_core.visible = u < 1.0
 	if _ring != null:
 		var u2 := clampf(t / 0.32, 0.0, 1.0)
-		_ring.scale = Vector3.ONE * lerpf(0.3, radius * 1.7, 1.0 - (1.0 - u2) * (1.0 - u2))
+		_ring.scale = Vector3.ONE * lerpf(0.3, fxr * 1.7, 1.0 - (1.0 - u2) * (1.0 - u2))
 		_ring_mat.albedo_color.a = 0.65 * (1.0 - u2)
 		_ring.visible = u2 < 1.0
 	if _decal != null:
 		_decal.albedo_mix = clampf((DECAL_LIFE - t) / 6.0, 0.0, 1.0)
+	if not _debris.is_empty():
+		_draw_debris()
 	for s in _sounds:
 		if float(s[0]) > 0.0:
 			s[0] = float(s[0]) - delta
@@ -428,7 +486,7 @@ func _physics_process(delta: float) -> void:
 			mi.queue_free()
 			continue
 		var v: Vector3 = d["vel"]
-		var p := mi.global_position
+		var p: Vector3 = d.get("p1", mi.global_position)     # (the sim state: _process draws between ticks)
 		v += Game.gravity_at(p) * delta
 		var np := p + v * delta
 		if v.length_squared() > 0.05:
@@ -443,13 +501,31 @@ func _physics_process(delta: float) -> void:
 					v = Vector3.ZERO
 		d["vel"] = v
 		var sp: Vector3 = d["spin"]
-		var b := mi.global_transform.basis.orthonormalized()
+		var b0: Basis = d.get("r1", mi.global_transform.basis.orthonormalized())
+		var b := b0
 		if sp.length_squared() > 0.01:
-			b = b.rotated(sp.normalized(), sp.length() * delta)
+			b = b.rotated(sp.normalized(), sp.length() * delta).orthonormalized()
 		var sc: float = float(d["s"]) * clampf((float(d["life"]) - t) * 2.0, 0.0, 1.0)
 		mi.global_transform = Transform3D(b.scaled(Vector3.ONE * maxf(sc, 0.01)), np)
+		# Render interpolation (perf pass 2026-10-07): 60 Hz steps on a faster screen read as stutter.
+		d["p0"] = p
+		d["p1"] = np
+		d["r0"] = b0
+		d["r1"] = b
+		d["sc"] = maxf(sc, 0.01)
 		keep.append(d)
 	_debris = keep
+
+
+## The debris chunks between their last two physics ticks.
+func _draw_debris() -> void:
+	var f := clampf(Engine.get_physics_interpolation_fraction(), 0.0, 1.0)
+	for d in _debris:
+		var mi: MeshInstance3D = d["mi"]
+		if not d.has("p0") or not is_instance_valid(mi):
+			continue
+		var r := Basis((d["r0"] as Basis).get_rotation_quaternion().slerp((d["r1"] as Basis).get_rotation_quaternion(), f))
+		mi.global_transform = Transform3D(r.scaled(Vector3.ONE * float(d["sc"])), (d["p0"] as Vector3).lerp(d["p1"], f))
 
 
 # =================================================================================================
@@ -472,6 +548,11 @@ func _play_sounds(pos: Vector3) -> void:
 		_sound3d(_ogg["main"], 0.0, randf_range(0.95, 1.04), delay, 30.0)
 	if _ogg["debris"] != null:
 		_sound3d(_ogg["debris"], -5.0, randf_range(0.92, 1.05), delay, 18.0)
+	# Close by: the synthesized body (a sharp hit over a 38 Hz drop and rumble, ArsenalAudio _boom)
+	# under the recording, so a blast near you lands in the chest (weapon-feel pass, 2026-10-05).
+	var body: AudioStream = synth("sub")
+	if body != null and d < 45.0:
+		_sound3d(body, lerpf(-3.0, -12.0, d / 45.0) + clampf((fxr - 5.0) * 0.4, -3.0, 3.0), randf_range(0.92, 1.02), delay, 20.0)
 	var far: AudioStream = _ogg["far"]
 	if far != null and d > 70.0:
 		var route := 0

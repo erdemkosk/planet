@@ -14,18 +14,26 @@ extends RefCounted
 ## Built once on a worker thread.
 ## Recorded foley (Sonniss: Pole Position gun handling, Gorification, Gamemaster; see
 ## scripts/audio/snd_lib.gd) replaces the synthesized clicks wherever a set exists (RECORDED); the
-## low synthesized layers (thump, punch, tail, echo), cloth and dart stay synthesized.
+## low synthesized layers (thump, punch, tail, echo) and dart stay synthesized. Cloth uses the
+## handling set foley/cloth (layered recorded foley + fabric, see sfx.gd FOLEY_SETS) when present.
 
 const Snd := preload("res://scripts/audio/snd_lib.gd")
 const RATE := 44100
 const NAMES := ["thump", "action", "tail", "dart", "tink", "dry", "cloth", "mag_release", "mag_out", "mag_in",
 		"mag_slap", "bolt_back", "bolt_fwd", "selector", "punch", "echo"]
 const HIT_NAMES := ["hit_thwack", "weak_ping", "kill_thump"]
+## Feedback layers built by HitFeel: near-miss whizz / supersonic snap, low-hp heartbeat, head ding.
+const FEEL_NAMES := ["whizz", "snap", "heartbeat", "head_ding"]
+## Sniper extras (weapon_base.gd builds them with the arsenal set): breath hold, bolt handle clicks.
+const SNIPER_NAMES := ["breath_in", "breath_out", "bolt_lift", "bolt_drop"]
+## Looped slide scrape (scripts/player/stance.gd).
+const LOOP_NAMES := ["scrape"]
 ## name -> recorded variant set (assets/audio/sonniss/...), played through an AudioStreamRandomizer.
 const RECORDED := {"action": "foley/action", "tink": "foley/tink", "dry": "foley/dry",
 		"mag_release": "foley/mag_release", "mag_out": "foley/mag_out", "mag_in": "foley/mag_in",
 		"mag_slap": "foley/mag_slap", "bolt_back": "foley/bolt_back", "bolt_fwd": "foley/bolt_fwd",
-		"selector": "foley/selector", "hit_thwack": "hit/thwack", "weak_ping": "hit/weak", "kill_thump": "hit/kill_thump"}
+		"selector": "foley/selector", "hit_thwack": "hit/thwack", "weak_ping": "hit/weak", "kill_thump": "hit/kill_thump",
+		"cloth": "foley/cloth"}
 
 var rng := RandomNumberGenerator.new()
 
@@ -90,6 +98,27 @@ func make(name: String) -> AudioStream:
 					[_thud(0.06, 220.0), 0.0, 0.6]], 0.2), 0.7)
 		"kill_thump":
 			return _wav(_kill_thump(), 0.92)
+		"whizz":
+			return _wav(_whizz(), 0.7)
+		"snap":
+			return _wav(_snap(), 0.9)
+		"heartbeat":
+			return _wav(_heartbeat(), 0.9)
+		"head_ding":
+			return _wav(_mix([[_click(0.32, [3950.0, 5920.0, 8150.0], 14.0, 0.15, 0.9), 0.0, 1.0],
+					[_click(0.05, [2600.0], 90.0, 0.8, 0.6), 0.0, 0.5]], 0.32), 0.75)
+		"breath_in":
+			return _wav(_breath(0.55, true), 0.35)
+		"breath_out":
+			return _wav(_breath(0.8, false), 0.35)
+		"bolt_lift":
+			return _wav(_mix([[_click(0.04, [2300.0, 3500.0], 80.0, 0.6, 0.5), 0.0, 1.0],
+					[_slide(0.05, 0.3, 0.5), 0.01, 0.4]], 0.07), 0.55)
+		"bolt_drop":
+			return _wav(_mix([[_click(0.05, [1900.0, 3100.0, 4400.0], 60.0, 0.7, 0.5), 0.0, 1.0],
+					[_thud(0.04, 260.0), 0.0, 0.5]], 0.07), 0.6)
+		"scrape":
+			return _loop_wav(_scrape(1.2))
 	return null
 
 
@@ -278,6 +307,106 @@ func _tail(dur: float) -> PackedFloat32Array:
 		lp2 += 0.12 * (lp - lp2)
 		var env := minf(t * 25.0, 1.0) * exp(-t * 3.2) * (0.85 + 0.15 * sin(t * 13.0))
 		s[i] = lp2 * env
+	return s
+
+
+## Looping WAV (forward loop over the whole buffer, ends cross-faded so the seam does not click).
+func _loop_wav(samples: PackedFloat32Array) -> AudioStreamWAV:
+	var n := samples.size()
+	var fade := int(0.06 * RATE)
+	for i in fade:
+		var k := float(i) / float(fade)
+		samples[i] = samples[i] * k + samples[n - fade + i] * (1.0 - k)
+	samples.resize(n - fade)
+	var w := _wav(samples, 0.8)
+	w.loop_mode = AudioStreamWAV.LOOP_FORWARD
+	w.loop_begin = 0
+	w.loop_end = samples.size()
+	return w
+
+
+## A bullet passing close by: band-passed noise that swells and falls with a doppler drop.
+func _whizz() -> PackedFloat32Array:
+	var s := _buf(0.32)
+	var lp := 0.0
+	var lp2 := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var u := t / 0.32
+		var cut := lerpf(0.55, 0.12, u)          # bright as it arrives, darker as it leaves
+		lp += cut * (_w() - lp)
+		lp2 += 0.08 * (lp - lp2)
+		var env := exp(-pow((u - 0.28) / 0.16, 2.0))
+		s[i] = (lp - lp2) * env
+	return s
+
+
+## Supersonic crack: a sharp N-wave with a short bright ring.
+func _snap() -> PackedFloat32Array:
+	var s := _buf(0.09)
+	var lp := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var nw := 0.0
+		if t < 0.0007:
+			nw = 1.0 - t / 0.00035
+		var n := _w()
+		lp += 0.5 * (n - lp)
+		var ring := (n - lp) * exp(-t * 160.0) * 0.55
+		s[i] = nw + ring + sin(TAU * 3300.0 * t) * exp(-t * 120.0) * 0.2
+	return s
+
+
+## Low-hp heartbeat: "lub-dub", two soft low thumps.
+func _heartbeat() -> PackedFloat32Array:
+	var s := _buf(0.55)
+	for beat in [[0.0, 1.0, 52.0], [0.2, 0.7, 46.0]]:
+		var off := int(float(beat[0]) * RATE)
+		var g: float = beat[1]
+		var f: float = beat[2]
+		var ph := 0.0
+		for i in int(0.22 * RATE):
+			var j := off + i
+			if j >= s.size():
+				break
+			var t := float(i) / RATE
+			ph += TAU * f * (1.0 + 0.6 * exp(-t * 40.0)) / RATE
+			s[j] += sin(ph) * exp(-t * 22.0) * minf(t * 300.0, 1.0) * g
+	for i in s.size():
+		s[i] = tanh(s[i] * 1.6)
+	return s
+
+
+## Breath in the helmet: soft filtered noise (in rises, out falls slower).
+func _breath(dur: float, inhale: bool) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var lp := 0.0
+	var lp2 := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var u := t / dur
+		lp += (0.25 if inhale else 0.16) * (_w() - lp)
+		lp2 += 0.03 * (lp - lp2)
+		var env := sin(PI * pow(u, 0.6 if inhale else 0.35)) * (1.0 - u * 0.3)
+		s[i] = (lp - lp2) * env
+	return s
+
+
+## Slide scrape: grainy low-mid noise with gravel crackle (looped, pitched by speed).
+func _scrape(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var lp := 0.0
+	var lp2 := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var n := _w()
+		lp += 0.22 * (n - lp)
+		lp2 += 0.015 * (lp - lp2)
+		var grit := 1.0 + 0.6 * sin(t * 61.0 + sin(t * 13.0) * 2.0)
+		var crackle := 0.0
+		if rng.randf() < 0.0025:
+			crackle = _w() * 2.5
+		s[i] = (lp - lp2) * grit + crackle * 0.3
 	return s
 
 

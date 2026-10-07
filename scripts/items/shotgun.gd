@@ -1,18 +1,24 @@
 extends "res://scripts/items/weapon_base.gd"
-## Pompalı (pump shotgun, key 3): 9 pellets per shell in a cone, brutal up close
-## (17 per pellet, full damage to 8 m, 35 % at 30 m), each pellet shoves the target a little.
+## Pompalı (pump shotgun, key 4, crafted at a Silahlık): 9 pellets per shell in a cone, brutal up close
+## (19 per pellet, full damage to 9 m, 40 % at 28 m), each pellet shoves the target: a point-blank blast
+## knocks a bot down (hit_reactor.gd), at range only a stagger. 2026-10-05 the user found the guns weak
+## ("silahlar güçsüz"): 17 / 8 m / 35 % at 30 m -> 19 / 9 m / 40 % at 28 m (a sure one-shot to ~10 m
+## from the hip, two to ~15-18 m), the push grows up close, louder report, bigger flash and kick.
 ## Every shot is followed by a visible pump stroke: the left hand drags the ribbed forend back (the
 ## red hull flies out of the port) and slams it home. Reloads shell by shell (R): the gun cants to
 ## show the loading port, the left hand fetches a shell and thumbs it in, again and again (fire to
 ## stop early); an empty gun gets racked at the end. Tube of 6.
 
+const WEIGHT := 0.97                      # mobility factor while held (item.gd carry_weight; loadout)
 const PUMP_TRAVEL := 0.075
 const PUMP_Z := -0.335
 const BORE_Y := 0.074
 const PELLETS := 9
-const PELLET_DMG := 17.0          # 153 per shell up close
+const PELLET_DMG := 19.0          # 171 per shell up close (AI_HP 100: one shot to ~10 m)
 const PELLET_SPEED := 380.0
-const FULL_DMG_DIST := 8.0        # full damage to 8 m, then down to 35 % at 30 m
+const FULL_DMG_DIST := 9.0        # full damage to 9 m, then down to FALL_MIN at FALL_END
+const FALL_END := 28.0
+const FALL_MIN := 0.4
 const PORT := Vector3(0.0, 0.006, -0.13)
 
 var _pump: Node3D
@@ -29,6 +35,7 @@ func _init() -> void:
 	item_name = "Pompalı"
 	item_desc = "Sol tık: ateş (her atıştan sonra pompalar) · Sağ tık: nişan · R: fişek fişek doldur (ateş edince durur)."
 	icon = "shotgun"
+	slot_key = 0                       # crafted at a Silahlık; the loadout (keys 1 / 2) carries it
 	accent = Color(1.0, 0.5, 0.22)
 	ammo_id = "ammo_shell"
 	ammo_title = "SAÇMA · 12 KALİBRE"
@@ -39,10 +46,14 @@ func _init() -> void:
 	shell_end = 0.38
 	shell_end_empty = 0.85
 	fire_rate = 1.35
-	ads_fov = 62.0
-	sight_rear = Vector3(0.0, 0.112, 0.02)
-	optic_y = 0.132
-	ads_eye = Vector3(0.0, 0.0, -0.25)
+	ads_fov = 69.0                   # a shotgun: only a small zoom when raised
+	short_name = "Pompalı"
+	head_mult = 1.5
+	kill_launch = 6.0
+	first_shot_k = 0.85              # the pattern is the pattern
+	sight_rear = Vector3(0.0, 0.128, 0.02)       # tall: the receiver stays under the view when aiming
+	optic_y = 0.148
+	ads_eye = Vector3(0.0, 0.0, -0.115)          # ~11 cm eye relief: the stock passes behind the eye
 	hip_pos = Vector3(0.17, -0.22, -0.38)
 	hip_bore_y = BORE_Y
 	reload_pos = Vector3(0.1, -0.16, -0.42)
@@ -52,19 +63,23 @@ func _init() -> void:
 	spread_ads = 0.045
 	bloom_add = 0.01
 	bloom_max = 0.02
-	kick_pitch = 0.135
+	kick_pitch = 0.15                # recoil pass: a huge single kick (~5.5° aimed, ~8° from the hip)
+	recoil_view = 0.6                # most of it settles back on its own (gun_feel.gd Climb)
 	kick_yaw = 0.03
 	kick_roll = 0.03
-	gun_kick = 11.5
-	shake_amt = 0.72
-	fov_punch_amt = -5.5
+	gun_kick = 12.5
+	shake_amt = 0.85
+	fov_punch_amt = -6.5
 	noise_radius = 70.0
 	crosshair_style = "circle"
 	hit_big = 0.45
 	hit_punch = 1.4
 	armor_pierce = 0.1
-	muzzle_energy = 9.0
-	punch_db = -3.0
+	muzzle_energy = 18.0
+	punch_db = -4.0
+	impact_cal = 0.65               # one pellet: smaller impacts (there are nine)
+	tail_db = -10.0
+	flash_long = 0.9
 	draw_time = 0.65
 	holster_time = 0.4
 
@@ -100,37 +115,55 @@ func _fire_shot(eye: Vector3, fwd: Vector3, cb: Basis, muzzle: Vector3) -> void:
 			var ang := TAU * float(i - 1) / float(PELLETS - 1) + randf_range(-0.3, 0.3)
 			var r := spread * randf_range(0.3, 1.0)
 			dir = (fwd + cb.x * cos(ang) * r + cb.y * sin(ang) * r).normalized()
-		fx.bullet(eye, dir * PELLET_SPEED * randf_range(0.95, 1.05) + player.velocity, muzzle, 0,
+		fx.bullet(eye, dir * PELLET_SPEED * randf_range(0.95, 1.05) * att_kit.stat("velocity") + player.velocity, muzzle, 0,
 				Color(1.0, 0.7, 0.35), false, 0)
 
 
 func _muzzle_fx(muzzle: Vector3, fwd: Vector3, up: Vector3, _cb: Basis) -> void:
 	_flash_t = 1.0
-	_randomize_flash(1.5)
-	fx.muzzle_light(muzzle + fwd * 0.9, Color(1.0, 0.68, 0.32), muzzle_energy, 0.06, 14.0)
-	fx.muzzle_smoke(muzzle + fwd * 0.15, fwd, up)
-	fx.muzzle_smoke(muzzle + fwd * 0.4, fwd, up)
-	fx.muzzle_smoke(muzzle + fwd * 0.7, fwd, up)
+	_randomize_flash(1.75)
+	fx.muzzle_light(muzzle + fwd * 0.9, Color(1.0, 0.68, 0.32), muzzle_energy, 0.07, 18.0)
+	fx.muzzle_smoke(muzzle + fwd * 0.15, fwd, up, 1.6)
+	fx.muzzle_smoke(muzzle + fwd * 0.4, fwd, up, 1.4)
+	fx.muzzle_smoke(muzzle + fwd * 0.7, fwd, up, 1.2)
+	ScreenPunch.kick(0.55)
 
 
 func _fire_sound() -> void:
 	var space := _space_kind()
 	_set_space(space)
-	# Recorded 12 gauge (TS Sound) at its own pitch, with its natural tail; the synthesized body
-	# layers only add a little weight under it.
-	_play("shotgun", -2.0, randf_range(0.96, 1.04), true, 0.9)
+	if space == 3:
+		# Vacuum: no report, only the blow through the suit.
+		_play("boom_body", -4.0, randf_range(0.9, 1.0), true)
+		_play("thump", -6.0, 0.75, true)
+		_shot_body(space, 0.82, -80.0)
+		return
+	# Recorded 12 gauge (TS Sound fire / slug, both mics, a 5.56 crack on top, mastered dense) with its
+	# own natural tail; the synthesized body layers add the chest blow under it, _shot_body the sub
+	# kick, the slap-back and (open air) the rolling tail.
+	_play("shotgun", -2.0, randf_range(0.97, 1.03), true, 1.5)
 	_play("boom_body", -6.0, randf_range(0.95, 1.05), true)
-	_play("thump", -8.0, 0.78, true)
-	_shot_body(space, 0.82, -12.0)
-	if space == 2:
+	_play("thump", -9.0, 0.78, true)
+	_shot_body(space, 0.82, -13.0)
+	if space == 2 and (_snd.get("gtail", []) as Array).is_empty():
 		_play("tail", -13.0, randf_range(0.85, 0.95), true)
 	elif space == 1:
 		_play("tail", -18.0, 1.15, true, 0.3)
 
 
 func _hit_damage(p: Vector3, _ammo: int) -> float:
-	var fall := 1.0 - clampf((_dist(p) - FULL_DMG_DIST) / 22.0, 0.0, 1.0) * 0.65
+	# (Attachments: a choke reaches 20 % further, a suppressor 10 % less: attachments.gd "range".)
+	var d := _dist(p) / att_kit.stat("range")
+	var fall := 1.0 - clampf((d - FULL_DMG_DIST) / (FALL_END - FULL_DMG_DIST), 0.0, 1.0) * (1.0 - FALL_MIN)
 	return PELLET_DMG * fall
+
+
+## Pellets shove harder up close (the coalesced blast in hit_reactor.gd: ~10 m/s point blank, a
+## knockdown; ~3 m/s at 15 m, a stagger).
+func _hit_spec(p: Vector3, ammo: int) -> Dictionary:
+	var s := super._hit_spec(p, ammo)
+	s["push"] = lerpf(1.15, 0.35, clampf((_dist(p) - 3.0) / 15.0, 0.0, 1.0))
+	return s
 
 
 func _dist(p: Vector3) -> float:
@@ -145,6 +178,11 @@ func _hit_impulse(_ammo: int) -> float:
 ## A killing pellet throws the body like the whole blast would (less from far away).
 func _death_push(p: Vector3) -> float:
 	return lerpf(24.0, 10.0, clampf((_dist(p) - 4.0) / 18.0, 0.0, 1.0))
+
+
+## Ragdoll launch of a kill: hard up close, little from far away.
+func _kill_launch(p: Vector3, _ammo: int) -> float:
+	return _death_push(p) * 0.3
 
 
 # =================================================================================================
@@ -326,24 +364,33 @@ func build_model() -> Node3D:
 		for sx in [-1.0, 1.0]:
 			VM.box(_gun, Vector3(0.019 * sx, by + 0.008, -0.235 - i * 0.042), Vector3(0.008, 0.012, 0.022), dark)
 	VM.ring(_gun, Vector3(0, by + 0.004, -0.5), Vector3.FORWARD, 0.022, 0.005, orange)
-	# Muzzle brake / shroud.
-	VM.soft_box(_gun, Vector3(0, by, -0.625), Vector3(0.034, 0.032, 0.05), 0.009, dark)
+	# Muzzle brake / shroud (its own node: a fitted suppressor / choke replaces it).
+	var brake := VM.node(_gun)
+	VM.soft_box(brake, Vector3(0, by, -0.625), Vector3(0.034, 0.032, 0.05), 0.009, dark)
 	for z in [-0.612, -0.635]:
 		for sx in [-1.0, 1.0]:
-			VM.box(_gun, Vector3(0.017 * sx, by, z), Vector3(0.004, 0.018, 0.008), black)
+			VM.box(brake, Vector3(0.017 * sx, by, z), Vector3(0.004, 0.018, 0.008), black)
 	_muzzle = VM.node(_gun, Vector3(0, by, -0.655))
 	# Tube magazine with an orange end cap and a barrel clamp.
 	VM.seg(_gun, Vector3(0, 0.035, -0.19), Vector3(0, 0.035, -0.585), 0.0125, 0.0125, dark, 12)
 	VM.seg(_gun, Vector3(0, 0.035, -0.585), Vector3(0, 0.035, -0.6), 0.0135, 0.011, orange, 12)
 	VM.soft_box(_gun, Vector3(0, 0.054, -0.555), Vector3(0.018, 0.05, 0.016), 0.005, dark)
-	# Sights: ghost ring on the receiver, front bead on a post.
-	VM.soft_box(_gun, Vector3(0, 0.1, 0.02), Vector3(0.026, 0.008, 0.02), 0.003, dark)
-	VM.ring(_gun, Vector3(0, sight_rear.y, 0.02), Vector3.BACK, 0.009, 0.0028, dark)
+	# Sights: ghost ring on the receiver, front bead on a post (their own node: hidden while an optic
+	# is fitted); the top rail between them stays (the optics clamp on it).
+	var irons := VM.node(_gun)
+	# A low base, a slim post under the ring and thin guard ears (a full-height 2.6 cm block under
+	# the ring was a wall at 11 cm eye relief).
+	var ring_lo := sight_rear.y - 0.009
+	VM.soft_box(irons, Vector3(0, 0.104, 0.02), Vector3(0.026, 0.008, 0.02), 0.003, dark)
+	VM.box(irons, Vector3(0, (0.108 + ring_lo) * 0.5, 0.02), Vector3(0.005, ring_lo - 0.108 + 0.001, 0.008), dark)
+	VM.ring(irons, Vector3(0, sight_rear.y, 0.02), Vector3.BACK, 0.009, 0.0028, dark)
+	# (Low guard shoulders, under the ring's centre: ears up past the ring read as two stray lines.)
 	for sx in [-1.0, 1.0]:
-		VM.box(_gun, Vector3(0.012 * sx, sight_rear.y - 0.002, 0.02), Vector3(0.004, 0.02, 0.008), dark)
+		VM.box(irons, Vector3(0.0125 * sx, (0.108 + sight_rear.y - 0.004) * 0.5, 0.02), Vector3(0.0034, sight_rear.y - 0.004 - 0.108, 0.008), dark)
 	VM.box(_gun, Vector3(0, 0.1, -0.075), Vector3(0.018, 0.005, 0.16), dark)
-	VM.box(_gun, Vector3(0, (by + 0.022 + sight_rear.y) * 0.5, -0.6), Vector3(0.006, sight_rear.y - by - 0.02, 0.01), dark)
-	VM.sphere(_gun, Vector3(0, sight_rear.y - 0.001, -0.6), 0.0026, VM.glow(Color(1.0, 0.55, 0.2), 4.0))
+	# (The bead's centre exactly on the sight line, the post's tip just under it.)
+	VM.box(irons, Vector3(0, (by + 0.018 + sight_rear.y) * 0.5, -0.6), Vector3(0.006, sight_rear.y - by - 0.02, 0.01), dark)
+	VM.sphere(irons, Vector3(0, sight_rear.y, -0.6), 0.0024, VM.glow(Color(1.0, 0.55, 0.2), 4.0))
 	# The pump: ribbed rubber forend riding on the tube, orange belly strip, steel action bars.
 	_pump = VM.node(_gun, Vector3(0, 0, PUMP_Z))
 	VM.seg(_pump, Vector3(0, 0.034, 0.065), Vector3(0, 0.034, -0.065), 0.025, 0.025, white, 12)
@@ -356,9 +403,20 @@ func build_model() -> Node3D:
 		VM.box(_pump, Vector3(0.018 * sx, 0.05, 0.09), Vector3(0.003, 0.006, 0.12), steel)
 	left_grip = VM.node(_pump, Vector3(-0.004, 0.026, -0.03), hand_basis(Vector3(-0.45, -0.83, 0.32), Vector3(0, 0, -1)))
 	_make_flash(_gun, Vector3(0, by, -0.665), 1.35)
-	var skip: Array = [_pump, _flash_root, _muzzle, _eject, _port]
+	var skip: Array = [_pump, _flash_root, _muzzle, _eject, _port, brake, irons]
 	VM.bake(_gun, skip)
 	VM.bake(_pump, [left_grip])
+	VM.bake(brake)
+	VM.bake(irons)
+	# Attachment mounts (attachments.gd; every compatible part built hidden): a suppressor / choke past
+	# the front bead, optics on the top rail, the foregrip under the pump (it rides the stroke; the left
+	# hand's descriptor is in pump space), the laser under the tube magazine.
+	att_kit.build(self, _gun, {
+		"muzzle": {"at": Vector3(0, by, -0.607), "r": 0.0135, "tip": -0.65, "sup_r": 0.024, "sup_len": 0.2,
+			"shift": [_muzzle, _flash_root], "default": brake},
+		"optic": {"y": 0.1025, "z": -0.07, "irons": sight_rear.y, "default": irons},
+		"under": {"grip": Vector3(0, 0.006, -0.01), "grip_parent": _pump, "laser": Vector3(0, 0.0225, -0.5)},
+	})
 	return model
 
 

@@ -2,11 +2,11 @@ extends Node3D
 ## Builds the world: a dark starry sky, a fixed sun, the two planets ("home" for the player,
 ## "rival" for the AI), the player, audio, the HUD and the pause menu.
 ##
-## Layout: the planets (Bodies.PLANET_RADIUS = 60 m) sit on the x axis Bodies.PLANET_DISTANCE =
-## 350 m apart (~230 m of open space between the surfaces), so everything stays well within 1 km
+## Layout: the planets (Bodies.PLANET_RADIUS = 30 m) sit on the x axis Bodies.PLANET_DISTANCE =
+## 350 m apart (~290 m of open space between the surfaces), so everything stays well within 1 km
 ## of the scene origin (no floating origin needed). The sun is fixed and side-on to that axis: both facing
 ## hemispheres get light on their sun side, and from either planet the other one hangs in the sky
-## as a half-lit disc (~23° across from the spawn point).
+## as a half-lit disc (~10° across from the spawn point).
 
 const Bodies := preload("res://scripts/planet/bodies.gd")
 const Player := preload("res://scripts/player/player.gd")
@@ -14,6 +14,9 @@ const Hud := preload("res://scripts/ui/hud.gd")
 const Sfx := preload("res://scripts/audio/sfx.gd")
 const PauseMenu := preload("res://scripts/save/pause_menu.gd")
 const War := preload("res://scripts/war/war.gd")
+const Training := preload("res://scripts/training/training.gd")
+const MotionBlur := preload("res://scripts/ui/motion_blur.gd")
+const RandomWorld := preload("res://scripts/planet/random_world.gd")
 ## Kept for the next phases (cannon, core, AI rival, shuttle). Preloaded here so the headless
 ## compile check covers them; nothing in phase 1 spawns them.
 const NEXT_PHASE_KIT := [
@@ -42,8 +45,23 @@ var sun: DirectionalLight3D
 func _ready() -> void:
 	Game.sun_dir = SUN_DIR.normalized()
 	_build_environment()
-	Game.planet = Bodies.spawn(self, "home", HOME_POS)
-	Game.rival = Bodies.spawn(self, "rival", RIVAL_POS)
+	# Random planets (scripts/planet/random_world.gd): both built from one world seed per match
+	# (single player: a new one each match; multiplayer: from the host's config, identical on both).
+	# Eğitim Alanı (scripts/training/training.gd): fixed planets, home is the grey test planet "Eğitim".
+	var world: Dictionary = {} if Training.active() else RandomWorld.generate(RandomWorld.match_seed())
+	RandomWorld.current = world
+	var home_over: Dictionary = Training.planet_overrides() if Training.active() else _planet_over(world, "home")
+	Game.planet = Bodies.spawn(self, "home", HOME_POS, home_over)
+	Game.rival = Bodies.spawn(self, "rival", RIVAL_POS, _planet_over(world, "rival"))
+	if Net.swap_perspective():
+		# Multiplayer PvP, the client plays the Rakip side: "home" (own planet, own core, spawn,
+		# build area) is the Rakip planet from its point of view (scripts/net/net.gd).
+		var yurt = Game.planet
+		Game.planet = Game.rival
+		Game.rival = yurt
+	# Combat areas (scripts/planet/poi.gd): stamped into both planets' density before anything spawns.
+	if not Training.active():
+		preload("res://scripts/planet/poi.gd").build_world(self)
 
 	var sfx = Sfx.new()
 	sfx.name = "Sfx"
@@ -56,6 +74,7 @@ func _ready() -> void:
 	Game.player = pl
 	Game.controlled = pl
 	pl.spawn(Game.planet)
+	add_child(MotionBlur.new())        # camera motion blur (Ayarlar › Hareket bulanıklığı)
 
 	var hud = Hud.new()
 	hud.name = "Hud"
@@ -68,7 +87,32 @@ func _ready() -> void:
 	Game.pause_menu = pm
 	# The war: cores, the AI rival, win / lose (scripts/war/war.gd).
 	add_child(War.new())
+	add_child(preload("res://scripts/war/respawn_ship.gd").new())   # Taşıyıcı carriers + dropship respawns
+	add_child(preload("res://scripts/war/caches.gd").new())         # Gömülü sandıklar ve eski kalıntılar (buried caches)
+	add_child(preload("res://scripts/war/cave_in.gd").new())        # tunnel cave-ins, burial, the entrench brushes
+	if Training.active():
+		add_child(Training.new())       # dummies, stats, the H panel
+	else:
+		add_child(preload("res://scripts/fx/space_battle.gd").new())   # cosmetic far-off space battle (Ayarlar › Arka plan savaşı)
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	if Net.active:
+		Net.world_built(self)          # multiplayer: sync hooks, the other player, the world stream
+	if not world.is_empty():
+		get_tree().create_timer(1.5).timeout.connect(_announce_world)
+
+
+## A planet's overrides: the multiplayer host's (preset seeds) under this match's random world.
+func _planet_over(world: Dictionary, preset: String) -> Dictionary:
+	var o: Dictionary = Net.planet_overrides(preset)
+	o.merge(world.get(preset, {}) as Dictionary, true)
+	return o
+
+
+## The random planets' names, once at the start ("Yurt — Kızıl Kum   ·   Rakip — Kül Ovası").
+func _announce_world() -> void:
+	var line := RandomWorld.names_line(Game.planet, Game.rival)
+	if line != "" and Game.hud != null and is_instance_valid(Game.hud):
+		Game.hud.alert(line, 0, "world_names", 4.5)
 
 
 func _build_environment() -> void:
@@ -113,7 +157,7 @@ func _build_environment() -> void:
 
 
 ## Where a player (or the AI rival) stands on `body`: on the side facing `other`, turned toward the
-## sun so the spot is lit (~50° from the point facing `other`: the other planet stands ~30° above
+## sun so the spot is lit (~50° from the point facing `other`: the other planet stands ~35° above
 ## the horizon, the sun ~50°), looking at the other planet (player.gd tilts the view up to frame
 ## it). Returns a transform on the unedited surface plus `lift` m (spawning snaps down to the real
 ## ground, player.gd).

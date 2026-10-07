@@ -7,9 +7,16 @@ extends "res://scripts/items/weapon_audio.gd"
 ##   motor                  minigun spin loop (looped WAV, pitched by spin), hiss   overheat steam
 ##   belt                   belt link rattle, pin / spoon   hand grenade, beep   cooking beep
 ##   inject                 injector click + hiss, shield_break   shield shatter sweep, shield_up   recharge
+## Kinetik İtici (scripts/items/kinetic_pusher.gd):
+##   push_charge            wind-up: capacitor whine sweeping up with a fizzing buzz (~0.2 s)
+##   push_whump             the blast: a heavy pressure "whump" under a dark air burst (~0.6 s)
+##   push_crackle           electric discharge crackle (~0.45 s), push_ready   capacitor-full chime
+## Roketatar rockets (scripts/items/rockets.gd), looped WAVs pitched by the flight:
+##   rocket_roar            tearing motor roar with solid-fuel crackle, rocket_whistle   coasting whistle
 
 const ARSENAL_NAMES := ["pump_back", "pump_fwd", "shell_in", "boom_body", "launch", "cyl_click", "bounce",
-		"boom", "boom_far", "motor", "hiss", "belt", "pin", "spoon", "beep", "inject", "shield_break", "shield_up"]
+		"boom", "boom_far", "motor", "hiss", "belt", "pin", "spoon", "beep", "inject", "shield_break", "shield_up",
+		"push_charge", "push_whump", "push_crackle", "push_ready", "rocket_roar", "rocket_whistle"]
 ## Recorded replacements (Sonniss: TS Sound 12 gauge, Bluezone detonation, 3maze motors, PMSFX air
 ## hiss, Sound Spark energy, Gorification blades...). boom_body stays synthesized (low body layer).
 const ARSENAL_RECORDED := {"pump_back": "foley/pump_back", "pump_fwd": "foley/pump_fwd", "shell_in": "foley/shell_in",
@@ -77,6 +84,24 @@ func make(name: String) -> AudioStream:
 			return _wav(_sweep(0.6, 1800.0, 160.0), 0.8)
 		"shield_up":
 			return _wav(_sweep(0.45, 300.0, 1400.0), 0.45)
+		"push_charge":
+			return _wav(_charge_whine(0.2), 0.6)
+		"push_whump":
+			return _wav(_whump(0.62), 0.97)
+		"push_crackle":
+			return _wav(_crackle(0.45), 0.7)
+		"push_ready":
+			return _wav(_mix([[_beep(0.06, 1320.0), 0.0, 0.7], [_beep(0.09, 1980.0), 0.065, 1.0],
+					[_click(0.03, [3800.0, 5200.0], 120.0, 0.3, 0.7), 0.0, 0.3]], 0.2), 0.45)
+		"rocket_roar":
+			return _loop_wav(_rocket_roar(1.3))
+		"rocket_whistle":
+			# Whole-cycle frequencies over exactly 1 s: loops without a seam.
+			var w := _wav(_rocket_whistle(1.0), 0.6)
+			w.loop_mode = AudioStreamWAV.LOOP_FORWARD
+			w.loop_begin = 0
+			w.loop_end = RATE
+			return w
 	return super.make(name)
 
 
@@ -182,4 +207,99 @@ func _sweep(dur: float, f0: float, f1: float) -> PackedFloat32Array:
 		lp += 0.4 * (_w() - lp)
 		var env := minf(t * 200.0, 1.0) * (1.0 - u) * (1.0 - u)
 		s[i] = (sin(ph) * 0.6 + sin(ph * 2.01) * 0.25 + lp * 0.35) * env
+	return s
+
+
+# --- Kinetik İtici / Roketatar -------------------------------------------------------------------
+
+## Capacitor wind-up: a whine sweeping 280 -> 1900 Hz with a square-ish sub buzz and a sizzle that
+## grows toward the release.
+func _charge_whine(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var ph := 0.0
+	var ph2 := 0.0
+	var lp := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var u := t / dur
+		var f := lerpf(280.0, 1900.0, u * u)
+		ph += TAU * f / RATE
+		ph2 += TAU * f * 1.503 / RATE
+		lp += 0.5 * (_w() - lp)
+		var buzz := signf(sin(ph * 0.5)) * 0.3
+		var env := minf(t * 60.0, 1.0) * (0.35 + 0.65 * u)
+		s[i] = (sin(ph) * 0.6 + sin(ph2) * 0.2 + buzz * 0.3 + lp * 0.3 * u) * env
+	return s
+
+
+## The shock: a 95 -> 32 Hz drop (the chest "whump") under a dark low-passed air burst, saturated.
+func _whump(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var ph := 0.0
+	var lp := 0.0
+	var lp2 := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var f := 32.0 + 63.0 * exp(-t * 14.0)
+		ph += TAU * f / RATE
+		var n := _w()
+		lp += 0.06 * (n - lp)
+		lp2 += 0.012 * (lp - lp2)
+		var body := sin(ph) * exp(-t * 6.5)
+		var air := (lp * 1.4 + lp2 * 2.5) * exp(-t * 7.0)
+		var att := minf(t * 900.0, 1.0)
+		s[i] = tanh((body * 1.6 + air) * att * 1.7)
+	return s
+
+
+## Electric discharge: sparse sharp snaps over a sizzling high band, thinning out as it decays.
+func _crackle(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var lp := 0.0
+	var snap := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var n := _w()
+		lp += 0.55 * (n - lp)
+		var hiss := (n - lp) * 0.35
+		if rng.randf() < 0.004 * exp(-t * 6.0):
+			snap = _w() * 1.5
+		snap *= 0.93
+		var env := exp(-t * 7.0) * minf(t * 2000.0, 1.0)
+		s[i] = (hiss + snap) * env
+	return s
+
+
+## Rocket motor (looped): low roar with a fluttering tearing band and random solid-fuel pops.
+func _rocket_roar(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var lp := 0.0
+	var lp2 := 0.0
+	var bp := 0.0
+	var pop := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		var n := _w()
+		lp += 0.09 * (n - lp)
+		lp2 += 0.02 * (lp - lp2)
+		bp += 0.35 * (n - bp)
+		if rng.randf() < 0.0012:
+			pop = _w() * 2.0
+		pop *= 0.96
+		var flutter := 0.75 + 0.25 * sin(t * TAU * 23.0 + sin(t * TAU * 7.0) * 2.0)
+		s[i] = lp2 * 3.2 + (lp - lp2) * 1.4 * flutter + (bp - lp) * 0.35 + pop * 0.6
+	return s
+
+
+## Coasting rocket: a resonant whistle (whole cycles per second, so 1 s loops) over airy noise.
+func _rocket_whistle(dur: float) -> PackedFloat32Array:
+	var s := _buf(dur)
+	var lp := 0.0
+	var lp2 := 0.0
+	for i in s.size():
+		var t := float(i) / RATE
+		lp += 0.4 * (_w() - lp)
+		lp2 += 0.12 * (lp - lp2)
+		var tone := sin(TAU * 1800.0 * t + sin(TAU * 3.0 * t) * 4.0) * 0.35 + sin(TAU * 2700.0 * t) * 0.1
+		s[i] = (lp - lp2) * 0.8 + tone * (0.8 + 0.2 * sin(TAU * 5.0 * t))
 	return s

@@ -32,6 +32,7 @@ var _soft: Texture2D
 func _ready() -> void:
 	top_level = true
 	global_transform = Transform3D.IDENTITY
+	add_to_group("grenade_sim")         # the kinetic pusher's shock wave finds the grenades here (shove)
 	for i in 4:
 		var p := AudioStreamPlayer3D.new()
 		p.unit_size = 6.0
@@ -43,6 +44,28 @@ func _ready() -> void:
 
 func in_flight() -> int:
 	return _list.size()
+
+
+## A shock wave (scripts/items/kinetic_pusher.gd): every grenade inside the cone from `from` along
+## `fwd` (half angle `cone` rad, out to `reach` m), flying or lying, gets lerp(v_near, v_far, d /
+## reach) m/s along the blast (lying ones take off again). Returns how many were hit.
+func shove(from: Vector3, fwd: Vector3, reach: float, cone: float, v_near: float, v_far: float) -> int:
+	var n := 0
+	for g in _list:
+		var node: Node3D = g["node"]
+		if not is_instance_valid(node):
+			continue
+		var to := node.global_position - from
+		var d := to.length()
+		if d > reach or d < 0.01:
+			continue
+		if acos(clampf(fwd.dot(to / d), -1.0, 1.0)) > cone + atan(0.4 / maxf(d, 0.3)):
+			continue
+		var dir := (to / d).lerp(fwd, 0.4).normalized()
+		g["vel"] = (g["vel"] as Vector3) + dir * lerpf(v_near, v_far, clampf(d / reach, 0.0, 1.0))
+		g["rest"] = false
+		n += 1
+	return n
 
 
 ## Launches a grenade. kind "40mm" or "hand"; cfg = Explosion config (+ "direct": impact damage).
@@ -105,9 +128,9 @@ func _physics_process(delta: float) -> void:
 				var hp: Vector3 = hit["position"]
 				var cfg: Dictionary = g["cfg"]
 				var direct := float(cfg.get("direct", 0.0)) * (1.0 if armed else 0.4)
-				if direct > 0.0:
+				if direct > 0.0 and not Net.is_client():     # (multiplayer: the host's replay hits)
 					var src: Vector3 = player.global_position if player != null and is_instance_valid(player) else hp - dir * 10.0
-					var r := Game.damage_target(body, direct, src, dir * 9.0)
+					var r := Game.damage_target(body, direct, src, dir * 9.0, "", hp)
 					HitFeel.inst().target_hit(body, r, direct, hp, {"big": 0.5})
 				if armed or g["kind"] == "hand":
 					_detonate(g, hp, -dir)
@@ -165,7 +188,8 @@ func _place(g: Dictionary, np: Vector3, v: Vector3, delta: float) -> void:
 func _blink(g: Dictionary) -> void:
 	if g["kind"] != "hand":
 		return
-	var led = (g["node"] as Node3D).get_meta("led", null)
+	var gn := g["node"] as Node3D
+	var led = gn.get_meta("led") if gn.has_meta("led") else null   # (a null default still errors in Godot 4)
 	if led is MeshInstance3D:
 		var f: float = g["fuse"]
 		var rate := 2.0 if f > 1.5 else 7.0

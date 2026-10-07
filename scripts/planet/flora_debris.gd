@@ -7,6 +7,8 @@ extends Node3D
 ##     like gravity), drop into the pit, thud, burst into wood chunks / leaves / dirt, then sink away
 ##   - bushes, grass, flowers, glow fungi: sucked into the hole, shrinking, with a dirt puff
 ##   - rocks, crystal clusters, ore pebbles: tumble and roll into the pit, then settle and sink
+##   - torn out by a shock wave (launch_flora, the kinetic pusher): rocks fly along the blast, bounce,
+##     settle; trees topple away from it
 ## Everything is animated by hand (no physics bodies) and capped, so it stays cheap.
 
 const MAX_BIG := 20              # simultaneous falling trees / tumbling rocks (a ship landing in a forest)
@@ -81,6 +83,43 @@ func spawn_small_batch(mesh: Mesh, xfs: Array, tints: Array, dig: Vector3) -> vo
 		return
 	var up: Vector3 = (xfs[0].origin - planet.global_position).normalized()
 	_spawn_small(mesh, xfs, tints, dig, up)
+
+
+## Torn out by a shock wave (planet.add_push_zone, the kinetic pusher): rocks, crystal clusters and
+## ore fly off along `vel` (m/s, world) with a tumble, arc under the planet's gravity, bounce once
+## on the ground and settle / sink; trees topple away along the blast; small plants are whisked
+## away. Capped like the rest.
+func launch_flora(kind: int, mesh: Mesh, xf: Transform3D, tint: Color, vel: Vector3) -> void:
+	if _fx.size() >= MAX_FX:
+		return
+	var up: Vector3 = (xf.origin - planet.global_position).normalized()
+	var flat := vel - up * vel.dot(up)
+	if kind in TREE_KINDS:
+		if _big >= MAX_BIG:
+			_dirt(xf.origin, up, 14, 1.4)
+			return
+		# Topples away from the blast (the "dig" point behind it), dropping a little.
+		var behind := xf.origin - (flat.normalized() if flat.length_squared() > 0.01 else up.cross(Vector3.RIGHT)) * 3.0
+		_spawn_tree(kind, mesh, xf, tint, behind, 1.6, up)
+		return
+	if kind in SMALL_KINDS:
+		_spawn_small(mesh, [xf], [tint], xf.origin + flat * 0.25, up)
+		return
+	if _big >= MAX_BIG:
+		_dirt(xf.origin, up, 10, 1.6)
+		return
+	var node := _instance(mesh, [xf], [tint], true)
+	node.global_transform = xf
+	var v := vel * _rng.randf_range(0.75, 1.1) + up * _rng.randf_range(1.0, 3.0)
+	var axis := up.cross(flat.normalized() if flat.length_squared() > 0.01 else Vector3.RIGHT)
+	if axis.length_squared() < 1e-4:
+		axis = Vector3.RIGHT
+	_fx.append({"type": "fly", "node": node, "t": 0.0, "pos": xf.origin, "basis": xf.basis, "vel": v,
+			"spin_axis": (axis.normalized() + Vector3(_rng.randf_range(-0.3, 0.3), _rng.randf_range(-0.3, 0.3), 0.0)).normalized(),
+			"spin": 0.0, "spin_rate": _rng.randf_range(6.0, 13.0), "bounces": 0, "rest_t": -1.0})
+	_big += 1
+	_dirt(xf.origin, up, 12, 1.4)
+	_sound("mine", -10.0, _rng.randf_range(0.5, 0.65), xf.origin)
 
 
 func spawn_ore(mesh: Mesh, xf: Transform3D, dig: Vector3) -> void:
@@ -225,13 +264,15 @@ func _process(delta: float) -> void:
 				done = _step_small(e)
 			"rock":
 				done = _step_rock(e, delta)
+			"fly":
+				done = _step_fly(e, delta)
 			"crush":
 				done = _step_crush(e)
 			_:
 				done = e["t"] >= e["dur"]
 		if done:
 			(e["node"] as Node).queue_free()
-			if e["type"] == "tree" or e["type"] == "rock":
+			if e["type"] == "tree" or e["type"] == "rock" or e["type"] == "fly":
 				_big -= 1
 			_fx.remove_at(i)
 		else:
@@ -321,6 +362,53 @@ func _step_rock(e: Dictionary, dt: float) -> bool:
 	node.global_transform = Transform3D(b.scaled(Vector3.ONE * (1.0 - settle * 0.85)) if settle > 0.0 else b,
 			pos - up * settle * 0.8)
 	return t > 3.3
+
+
+## A thrown rock: the planet's own gravity, the ground from its density field (works far from any
+## collider), one or two bounces, then it rests, sinks and shrinks away (~5 s at most).
+func _step_fly(e: Dictionary, dt: float) -> bool:
+	var t: float = e["t"]
+	var node: MultiMeshInstance3D = e["node"]
+	var pos: Vector3 = e["pos"]
+	var c: Vector3 = planet.global_position
+	var up := (pos - c).normalized()
+	var rest_t: float = e["rest_t"]
+	if rest_t < 0.0:
+		var vel: Vector3 = e["vel"]
+		var dist := pos.distance_to(c)
+		var g := float(planet.gravity_accel(dist)) if planet.has_method("gravity_accel") else 9.0
+		vel -= up * g * dt
+		var np := pos + vel * dt
+		e["spin"] = float(e["spin"]) + float(e["spin_rate"]) * dt
+		if planet.has_method("density_fast") and float(planet.density_fast(np)) < 0.0 and vel.dot(up) < 0.0:
+			var b := int(e["bounces"])
+			var speed := vel.length()
+			if b < 2 and speed > 3.0:
+				# Bounce: lose most of the speed into the ground, keep some along it.
+				var vn := up * vel.dot(up)
+				vel = (vel - vn) * 0.5 - vn * 0.3
+				e["spin_rate"] = float(e["spin_rate"]) * 0.6
+				e["bounces"] = b + 1
+				_sound("impact_light", -12.0 - b * 4.0, 0.5, np)
+				_dirt(pos, up, 8, 0.7)
+				np = pos
+			else:
+				e["rest_t"] = t
+				_sound("impact_light", -16.0, 0.42, np)
+				np = pos
+		pos = np
+		e["vel"] = vel
+		e["pos"] = pos
+		if t > 6.0:
+			e["rest_t"] = t
+	rest_t = float(e["rest_t"])
+	var settle := 0.0
+	if rest_t >= 0.0:
+		settle = smoothstep(rest_t + 1.2, rest_t + 2.6, t)
+	var b2 := Basis(e["spin_axis"], e["spin"]) * (e["basis"] as Basis)
+	node.global_transform = Transform3D(b2.scaled(Vector3.ONE * (1.0 - settle * 0.85)) if settle > 0.0 else b2,
+			pos - up * settle * 0.8)
+	return rest_t >= 0.0 and t > rest_t + 2.7
 
 
 ## Crushed by a ship coming down (planet.gd fell_flora): bushes, grass, flowers and fungi are pressed

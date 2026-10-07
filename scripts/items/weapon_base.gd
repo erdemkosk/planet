@@ -11,8 +11,28 @@ extends "res://scripts/items/item.gd"
 ## Reloads are either a whole magazine (reload_kind "mag") or round by round ("shell": start,
 ## insert × n, end; firing interrupts). Subclasses set the tunables in _init and override
 ## build_model(), _fire_shot(), _fire_sound(), _animate_model() and the reload event hooks.
+## Feel shared with the rifle (scripts/items/gun_feel.gd): a learnable recoil pattern (recoil_climb,
+## recoil_h) with a camera hold-then-recover, first-shot accuracy, stance modifiers (crouch tighter,
+## slide steadier than a run), view-model inertia (strafe cant, landing dip, slide cant), head zone
+## (head_mult), kill launch, hit reactions, suit impacts, kill feed. In vacuum the shot is only a
+## suit-borne thump (no crack, tail or echo). Optional camera hooks for subclasses: _cam_fov(e),
+## _cam_look(e), _cam_extra() (the sniper's scope zoom and sway).
+## Handling (scripts/items/handling.gd, `_hd`): wall pull-back (aim eased out, firing blocked when
+## fully back), inspect (hold Y; virtual _inspect_touch(u, w) for a special touch, optional
+## _inspect_point() for where the left hand checks), aim-in / out foley, melee_interrupt() (V).
+## Attachments (scripts/items/attachments.gd, `att_kit`): a gun whose build_model calls
+## att_kit.build(self, _gun, mounts) gets the middle mouse radial (scripts/ui/attachment_radial.gd);
+## the stats layer scales recoil / spread / sway / aim speed / flash / sound here, sight_point() and
+## _cam_fov() follow the optic, save_state()["att"], get_attachments() / set_attachments(), signal
+## attachments_changed. B is the gun's own mode (toggle_mode); the middle mouse is never a mode or a
+## reload any more.
+## Recoil (2026-10-05, MW-like): recoil_view of each shot's camera kick climbs the view itself
+## (gun_feel.gd Climb: pulled down against, recovered after the string as far as not pulled back),
+## the rest is the snap on _recoil; recoil_first: the first round's ×; recoil_jitter: random
+## per-shot snap (rad, the SMG's chatter).
 
 const Settings := preload("res://scripts/save/settings.gd")
+const GunFeel := preload("res://scripts/items/gun_feel.gd")
 const Rifle := preload("res://scripts/items/rifle.gd")
 const RifleFx := preload("res://scripts/items/rifle_fx.gd")
 const WeaponHud := preload("res://scripts/items/weapon_hud.gd")
@@ -20,6 +40,13 @@ const WeaponAudio := preload("res://scripts/items/weapon_audio.gd")
 const ArsenalAudio := preload("res://scripts/items/arsenal_audio.gd")
 const Snd := preload("res://scripts/audio/snd_lib.gd")
 const HitFeel := preload("res://scripts/items/hit_feel.gd")
+const Handling := preload("res://scripts/items/handling.gd")
+const ScreenPunch := preload("res://scripts/items/screen_punch.gd")   # heavy guns' screen impulse
+const Attachments := preload("res://scripts/items/attachments.gd")
+const AttachmentRadial := preload("res://scripts/ui/attachment_radial.gd")
+
+## Fitted attachments changed ({slot: id}): multiplayer syncs remote players' guns with it.
+signal attachments_changed(state: Dictionary)
 
 # --- Tunables (subclasses set these in _init) ----------------------------------------------------
 var hip_fov := 75.0
@@ -69,6 +96,28 @@ var armor_pierce := 0.15                       # share of a creature's armor one
 var kick_roll := 0.01                          # camera roll kick per shot (rad)
 var muzzle_energy := 6.0                       # muzzle light flash
 var punch_db := -4.0                           # sub-bass "punch" layer under the shot (-80 = none)
+var recoil_climb := 0.3                        # extra kick per shot of a string (6th shot: +30 %)
+var recoil_h := PackedFloat32Array([0.0, 0.35, 0.6, 0.25, -0.35, -0.7, -0.45, 0.15])  # sideways pattern (× kick_yaw)
+var recoil_hold := 0.06                        # s the camera kick holds before it recovers
+var recoil_recover := 1.0                      # recovery speed multiplier
+var head_mult := 2.0                           # head-zone damage multiplier (0 = no head zone)
+var kill_launch := 4.0                         # m/s ragdoll launch along the bullet on a kill
+var short_name := ""                           # kill feed name ("Pompalı")
+var ads_k := 110.0                             # aim spring stiffness / damping (raise to the sights)
+var ads_c := 13.5
+var first_shot_rest := 0.35                    # s of rest that make the next shot a "first shot"
+var first_shot_k := 0.5                        # spread multiplier of a first shot
+# Weapon-feel pass (2026-10-05, the user: "silahlar güçsüz / ses zayıf / görsel zayıf").
+var impact_cal := 1.0                          # calibre of the impact effects (rifle_fx.gd; 1 = rifle round)
+var flash_long := 1.0                          # muzzle flash plume length (Rifle.build_flash; the sniper's long jet)
+var tail_db := -80.0                           # outdoors: the recorded rolling tail (weap/gtail) under the shot (-80 = none)
+# Recoil pass (2026-10-05, "geri tepmeyi iyi hissedelim, seri atışta").
+var recoil_view := 0.65                        # share of the camera kick that climbs the view (gun_feel.gd Climb)
+var recoil_first := 1.0                        # the first round of a string kicks × this
+var recoil_jitter := 0.0                       # rad of random snap per shot (not learnable: the SMG's chatter)
+## A click during the cooldown is kept this long and fires the moment the gun is ready.
+const PRESS_BUFFER := 0.14
+const TAIL_GAP := 0.2                          # s: an outdoor tail at most this often
 
 # --- Read by the view model ------------------------------------------------------------------------
 var pose_override := Transform3D()
@@ -98,6 +147,9 @@ var audio_log: Array = []
 var _ads_vel := 0.0
 var _ads_want := false
 var _cooldown := 0.0
+var _press_buf := 0.0                          # s a click during the cooldown stays queued (PRESS_BUFFER)
+var _tail_t := 0                               # msec of the last outdoor tail (TAIL_GAP)
+var _new_heavy := false                        # "heavy" is the dense weap/ar_heavy report (not the old cut)
 var _trigger_prev := false
 var _trig := false
 var _bloom := 0.0
@@ -114,11 +166,6 @@ var _flash_t := 0.0
 var _rk := Vector4.ZERO
 var _rk_vel := Vector4.ZERO
 var _sprint_w := 0.0
-var _bob_amt := 0.0
-var _bob_ph := 0.0
-var _sway := Vector2.ZERO
-var _sway_vel := Vector2.ZERO
-var _vy := 0.0
 var _look_acc := Vector2.ZERO
 var _since_shot := 9.0
 var _sprint := false
@@ -136,6 +183,16 @@ var _shell_need := 1
 var _shell_done := 0
 var _shell_interrupt := false
 var _shell_ev := 0
+# Shared feel (gun_feel.gd).
+var _rc := GunFeel.Recoil.new()
+var _motion := GunFeel.Motion.new()
+var _carry := GunFeel.Carry.new()              # sprint pose + stride sway, bob, breathing, look sway
+var _hd = Handling.Hand.new()                  # handling.gd: inspect, aim foley
+var _climb := GunFeel.Climb.new()              # the view climb you pull against
+## Attachments (attachments.gd): what is fitted, the stats layer, the parts, the fit animation.
+var att_kit = Attachments.Kit.new()
+var grip_left = null                           # the left hand's descriptor while a foregrip is fitted (viewmodel.gd)
+var _sbus := "Weapons"                         # bus of the gunshot layers (the suppressed one while suppressed)
 
 # Model parts (subclasses fill these).
 var _gun: Node3D
@@ -168,6 +225,7 @@ func _ready() -> void:
 	hud.weapon = self
 	add_child(hud)
 	_setup_audio()
+	att_kit.bind(self)
 	call_deferred("_build_tp_prop")
 
 
@@ -271,13 +329,45 @@ func _cancel_reload() -> void:
 	_shell_phase = -1
 
 
-## Per-weapon save data (scripts/player/player.gd stores it under "item_<id>").
+## A melee swing started (scripts/player/melee.gd, V): the reload and the inspect are dropped.
+func melee_interrupt() -> void:
+	if reloading:
+		_cancel_reload()
+	Handling.gun_melee(self)
+
+
+## Inspect (Y) special touch, called every frame of the inspect after _animate_model: u = 0..1 of
+## the timeline, w = 1 while playing (falls to 0 when cancelled). Default: nothing.
+func _inspect_touch(_u: float, _w: float) -> void:
+	pass
+
+
+## Per-weapon save data (scripts/player/player.gd stores it under "item_<id>"; a dropped gun carries
+## it, the fitted attachments included).
 func save_state() -> Dictionary:
-	return {"mag": mag}
+	return {"mag": mag, "att": att_kit.state()}
 
 
 func load_state(d: Dictionary) -> void:
 	mag = clampi(int(d.get("mag", mag)), 0, mag_capacity())
+	if d.get("att") is Dictionary:
+		set_attachments(d["att"])
+
+
+## Fitted attachments {slot: id} (attachments.gd; multiplayer reads / writes these).
+func get_attachments() -> Dictionary:
+	return att_kit.state()
+
+
+## Fits exactly `d` ({slot: id}) at once, no animation (a picked-up gun, a remote player's gun).
+func set_attachments(d: Dictionary) -> void:
+	att_kit.bind(self)
+	att_kit.set_state(d)
+
+
+## One HUD line of what is fitted ("Susturucu · Refleks"; "" with nothing).
+func attachment_text() -> String:
+	return att_kit.text()
 
 
 # =================================================================================================
@@ -288,11 +378,16 @@ func _unhandled_input(event: InputEvent) -> void:
 	if debug_ignore_input or not can_operate():
 		return
 	var middle := event is InputEventMouseButton and (event as InputEventMouseButton).button_index == MOUSE_BUTTON_MIDDLE
-	if (middle and event.is_pressed()) or (event is InputEventKey and event.pressed and not event.echo \
-			and (event as InputEventKey).physical_keycode == KEY_B):
+	if middle:
+		# Middle mouse held: the attachment radial on a gun with mounts (attachment_radial.gd); consumed
+		# on every gun, so the "tool_mode" action (R + middle mouse) never reloads from it.
+		if event.is_pressed() and att_kit.has_slots():
+			AttachmentRadial.open_for(self)
+		get_viewport().set_input_as_handled()
+	elif event is InputEventKey and event.pressed and not event.echo and (event as InputEventKey).physical_keycode == KEY_B:
 		toggle_mode()
 		get_viewport().set_input_as_handled()
-	elif event.is_action_pressed("tool_mode") and not middle:
+	elif event.is_action_pressed("tool_mode"):
 		reload()
 		get_viewport().set_input_as_handled()
 
@@ -302,7 +397,7 @@ func _input(event: InputEvent) -> void:
 		_look_acc += (event as InputEventMouseMotion).relative
 
 
-## B / middle mouse: weapon-specific mode (launcher fuse mode). Default: nothing.
+## B: weapon-specific mode (launcher fuse mode). Default: nothing.
 func toggle_mode() -> void:
 	if Game.sfx:
 		Game.sfx.play("error", -14.0)
@@ -347,7 +442,8 @@ func _shell_each() -> float:
 
 func _physics_process(delta: float) -> void:
 	_cooldown -= delta
-	if not can_operate() or player == null or player.vehicle != null:
+	# (The attachment radial open on this gun holds fire and aim; attachments.gd.)
+	if not can_operate() or player == null or player.vehicle != null or Attachments.radial_on(self):
 		_trigger_prev = false
 		_trig = false
 		_ads_want = false
@@ -359,14 +455,32 @@ func _physics_process(delta: float) -> void:
 	var pressed := (trig and not _trigger_prev) or (real and Input.is_action_just_pressed("tool_use"))
 	_trigger_prev = trig
 	_trig = trig
+	# Input buffer: a click while the gun still cycles (pump, bolt, cooldown) fires the moment it is
+	# ready (PRESS_BUFFER); delivered once as a press with the trigger held.
+	if pressed and _cooldown > 0.0:
+		_press_buf = PRESS_BUFFER
+	elif _press_buf > 0.0:
+		_press_buf -= delta
+		if _cooldown <= 0.0 and _press_buf > 0.0:
+			pressed = true
+			trig = true
+			_press_buf = 0.0
 	var up: Vector3 = player.global_transform.basis.y
 	var hv: Vector3 = player.velocity - up * player.velocity.dot(up)
-	# Sprint pose follows the player's run (kept through a hop), not is_on_floor().
+	# Sprint pose follows the player's run (kept through a hop), not is_on_floor(). (Above 5 m/s: the
+	# 2026-10-06 tok sprint is 6.8 m/s, × 0.86 with the rocket launcher; was 6.0 for 8.2.)
 	_sprint = (debug_sprint or (real and Input.is_action_pressed("sprint"))) and hv.length() > 5.0 \
 			and (float(player.get("_sprint_k")) > 0.5 or debug_sprint) and ads < 0.2 and _sprint_allowed()
 	_since_sprint = 0.0 if _sprint else _since_sprint + delta
 	var alt := (real and Input.is_action_pressed("tool_alt")) or debug_ads
-	_ads_want = alt and can_ads and not _sprint and not reloading
+	_ads_want = alt and can_ads and not _sprint and not reloading and not att_kit.busy()
+	# Handling (handling.gd): inspect (Y), wall / melee / inspect blocks, aim foley.
+	if Handling.gun_physics(self, real, pressed, alt):
+		trig = false
+		pressed = false
+	if att_kit.busy():                             # fitting an attachment: the hands are on it
+		trig = false
+		pressed = false
 	_trigger(trig, pressed, alt, delta)
 
 
@@ -420,23 +534,55 @@ func fire() -> void:
 	Game.shot_fired.emit(player.aim_origin(), fwd, "home")     # rival bots react (ai_rival.gd)
 	_bloom = minf(_bloom + bloom_add, bloom_max)
 	var aim := clampf(ads, 0.0, 1.0)
-	var rec := 1.0
-	var aim_k := (1.0 - aim * 0.35) * rec
-	_recoil_target += Vector2(kick_pitch * randf_range(0.85, 1.2), randf_range(-1.0, 1.0) * kick_yaw) * aim_k
+	var rec := GunFeel.stance_recoil(player)
+	var aim_k := (1.0 - aim * 0.3) * rec
+	# Learnable pattern: climbs a little each shot of a string, drifts along the gun's table; a fresh
+	# string's first round snaps harder (recoil_first). recoil_view of it climbs the view (gun_feel.gd
+	# Climb: pulled down against, recovered after the string as far as not pulled back), the rest is
+	# the snap on _recoil (+ recoil_jitter, the chatter nobody can learn). Attachments scale the climb
+	# / sideways / shake.
+	var rk := _rc.next(kick_pitch, kick_yaw, recoil_climb, recoil_h, recoil_first) * aim_k \
+			* Vector2(att_kit.stat("climb"), att_kit.stat("horiz")) * GunFeel.KICK_K    # (2026-10-06 tok: heavier)
+	_climb.shot(rk * recoil_view)
+	_recoil_target += rk * (1.0 - recoil_view)
+	if recoil_jitter > 0.0:
+		_recoil_target += Vector2(randf_range(-0.6, 1.0), randf_range(-1.0, 1.0)) * recoil_jitter * aim_k
 	_recoil_target.x = minf(_recoil_target.x, 0.22)
-	# The kick snaps in (camera recoil + a little roll) and recovers fast (see _process).
+	# The snap lands at once (camera recoil + a little roll) and recovers fast (see _process).
 	_recoil = _recoil.lerp(_recoil_target, 0.35)
 	_roll_v += randf_range(-1.0, 1.0) * kick_roll * 60.0 * aim_k
-	_trauma = minf(_trauma + shake_amt * aim_k, 1.0)
-	_fov_punch += fov_punch_amt * rec
-	var gk := gun_kick * rec
+	# Shake and the FOV punch per shot, lighter for a full-auto gun (they stack) and aimed.
+	_trauma = minf(_trauma + shake_amt * aim_k * att_kit.stat("shake") * (0.45 if auto_fire else 1.0), 1.0)
+	_fov_punch += fov_punch_amt * rec * lerpf(1.0, 0.6, aim) * (0.5 if auto_fire else 1.0)
+	if auto_fire:
+		ScreenPunch.kick(0.07 * (1.0 - aim * 0.5))   # a very light screen punch on each full-auto round
+	# Visible gun kick (same model as rifle.gd fire()): part lands at once (the gun jumps on the shot
+	# frame), the rest as velocity into the stiff recoil spring: muzzle flip about the stock (a
+	# compensator tames half of it), a hard back-thrust, a little roll mostly to the right, a random
+	# jitter; peaks ~45 ms after the shot, home in ~0.25 s. Aimed it is mostly the back-thrust.
+	var gk := gun_kick * rec * GunFeel.GUN_KICK_K       # (2026-10-06 tok: a harder visible kick)
+	var flip := lerpf(1.0, att_kit.stat("climb"), 0.5)
 	var hip_k := 1.0 - aim * 0.55
-	_rk_vel += Vector4(gk * 0.95 * hip_k, randf_range(-1.0, 1.0) * gk * 0.14 * hip_k,
-			randf_range(-1.0, 1.0) * gk * 0.12 * hip_k, gk * 0.6 * lerpf(1.0, 0.45, aim))
+	var back_k := lerpf(1.0, 0.65, aim)
+	var roll_s := randf_range(-0.4, 1.0)
+	var jit := Vector2(randf_range(-1.0, 1.0), randf_range(-1.0, 1.0))
+	_rk += Vector4(gk * 0.012 * hip_k * flip, jit.x * gk * 0.0022 * hip_k,
+			roll_s * gk * 0.0055 * hip_k, gk * 0.007 * back_k)
+	_rk_vel += Vector4(gk * (0.65 + 0.12 * jit.y) * hip_k * flip, jit.x * gk * 0.13 * hip_k,
+			roll_s * gk * 0.17 * hip_k, gk * 0.32 * back_k)
 	_since_shot = 0.0
 	_use_t = 0.09
+	# Muzzle effects with the attachments' flash / light (a suppressor: a wisp, no light).
+	var me := muzzle_energy
+	muzzle_energy *= att_kit.stat("light")
 	_muzzle_fx(muzzle, fwd, up, cb)
-	_fire_sound()
+	muzzle_energy = me
+	if _flash_root != null:
+		_flash_root.scale *= att_kit.stat("flash")
+	if att_kit.suppressed():
+		_fire_sound_sup()
+	else:
+		_fire_sound()
 	if mag == 0 and reserve_count() > 0:
 		_cooldown = maxf(_cooldown, 0.3)
 
@@ -450,7 +596,7 @@ func _fire_shot(eye: Vector3, fwd: Vector3, cb: Basis, muzzle: Vector3) -> void:
 func _muzzle_fx(muzzle: Vector3, fwd: Vector3, up: Vector3, _cb: Basis) -> void:
 	_flash_t = 1.0
 	_randomize_flash(1.0)
-	fx.muzzle_light(muzzle + fwd * 0.9, Color(1.0, 0.72, 0.38), muzzle_energy, 0.045, 12.0)
+	fx.muzzle_light(muzzle + fwd * 0.9, Color(1.0, 0.72, 0.38), muzzle_energy, 0.05, 16.0)
 	fx.muzzle_smoke(muzzle + fwd * 0.15, fwd, up)
 
 
@@ -458,12 +604,39 @@ func _fire_sound() -> void:
 	pass
 
 
-## Shared gunshot weight: the sub-bass punch and, outdoors, the terrain slap-back.
+## Suppressed shot (attachments.gd SUP_SOUND per gun): a muffled short report through the low-passed
+## WeaponsSup bus, the low body, the action's clack close and clear; no crack layer, sub punch,
+## outdoor tail or slap-back (a short dark tail in a tunnel). In vacuum the gun's own suit thump.
+func _fire_sound_sup() -> void:
+	var space := _space_kind()
+	if space == 3:
+		_fire_sound()
+		return
+	_set_space(space)
+	var sp: Dictionary = Attachments.sup_sound(item_id)
+	var pitch := randf_range(0.96, 1.04)
+	_sbus = Attachments.sup_bus()
+	_play(str(sp["rep"]), float(sp["db"]), float(sp["pitch"]) * pitch, true, float(sp["cut"]))
+	_play("thump", float(sp["thump"]), float(sp["tpitch"]) * pitch, true)
+	_play("action", float(sp["action"]), float(sp["apitch"]) * randf_range(0.95, 1.08))
+	if space == 1:
+		_play("tail", -27.0, 1.3, true, 0.18)
+	_sbus = "Weapons"
+
+
+## Shared gunshot weight: the sub-bass punch and, outdoors, the terrain slap-back plus the recorded
+## rolling outdoor tail (weap/gtail at tail_db, one per TAIL_GAP). space 3 (vacuum): the punch only, a
+## little louder (felt through the suit; sfx.gd low-passes the Weapons bus).
 func _shot_body(space: int, pitch := 1.0, echo_db := -13.0) -> void:
 	if punch_db > -60.0:
-		_play("punch", punch_db, pitch * randf_range(0.95, 1.05), true)
+		_play("punch", punch_db + (2.0 if space == 3 else 0.0), pitch * randf_range(0.95, 1.05), true)
 	if space == 2 and echo_db > -60.0:
 		_play("echo", echo_db, randf_range(0.9, 1.05) * pitch, true)
+	if space == 2 and tail_db > -60.0 and not (_snd.get("gtail", []) as Array).is_empty():
+		var now := Time.get_ticks_msec()
+		if now - _tail_t >= int(TAIL_GAP * 1000.0):
+			_tail_t = now
+			_play("gtail", tail_db, randf_range(0.94, 1.04) * clampf(pitch * 1.15, 0.8, 1.05), true)
 
 
 func _spread_dir(fwd: Vector3, cb: Basis, spread: float) -> Vector3:
@@ -480,9 +653,14 @@ func current_spread() -> float:
 	if player != null:
 		var up: Vector3 = player.global_transform.basis.y
 		var hv: Vector3 = player.velocity - up * player.velocity.dot(up)
-		mv = clampf(hv.length() / 6.0, 0.0, 1.0) * 0.014 + (0.0 if player.is_on_floor() else 0.016)
-	var base := lerpf(spread_hip, spread_ads, aim) * 1.0
-	return base + _bloom * (1.0 - aim * 0.6) + mv * (1.0 - aim * 0.6)
+		mv = clampf(hv.length() / 6.0, 0.0, 1.0) * 0.014 * GunFeel.stance_move(player) + (0.0 if player.is_on_floor() else 0.016)
+	# Attachments: a laser tightens the hip cone ("hip"), a choke the whole pattern ("spread").
+	var hk := att_kit.stat("hip")
+	var base := lerpf(spread_hip * hk, spread_ads, aim) * GunFeel.stance_spread(player) * att_kit.stat("spread")
+	# First-shot accuracy: a rested gun puts its first round tighter.
+	if _since_shot > first_shot_rest:
+		base *= first_shot_k
+	return base + (_bloom + mv) * (1.0 - aim * 0.6) * lerpf(hk, 1.0, aim)
 
 
 ## Damage of one bullet / pellet that hit at `p` (subclasses add falloff).
@@ -494,25 +672,34 @@ func _hit_impulse(_ammo: int) -> float:
 	return 6.0
 
 
+## Ragdoll launch (m/s along the bullet) when the hit at p kills.
+func _kill_launch(_p: Vector3, _ammo: int) -> float:
+	return kill_launch
+
+
+## Everything GunFeel.body_hit needs for one bullet / pellet hit at p (subclasses may add "heavy").
+func _hit_spec(p: Vector3, ammo: int) -> Dictionary:
+	return {"dmg": _hit_damage(p, ammo), "head": head_mult, "push": _hit_impulse(ammo) * 0.15,
+			"launch": _kill_launch(p, ammo), "big": hit_big, "name": short_name if short_name != "" else item_name,
+			"cal": impact_cal}
+
+
 ## Called by the fx node for every bullet / pellet hit. Returns true when it stops.
 ## info["type"]: "body" (a damageable: info["target"]), "terrain", "metal".
 func bullet_hit(info: Dictionary, dir: Vector3, ammo: int, _pierced: int) -> bool:
 	var p: Vector3 = info["point"]
 	var n: Vector3 = info["normal"]
 	last_impact = p
-	var src: Vector3 = player.global_position if player != null else p - dir * 30.0
 	match info["type"]:
 		"body":
 			var t = info["target"]
-			var dmg := _hit_damage(p, ammo)
-			var r := Game.damage_target(t, dmg, src, dir * _hit_impulse(ammo) * 0.15, "home")
-			fx.impact_metal(p, n, dir, false)
+			# Head zone, damage, kill launch, hit reaction, suit / visor effects, markers, kill feed.
+			GunFeel.body_hit(self, t, p, n, dir, _hit_spec(p, ammo))
 			hits += 1
-			HitFeel.inst().target_hit(t, r, dmg, p, {"big": hit_big})
 		"terrain":
-			fx.impact_terrain(p, n, dir, _ground_color(p, n), false, hit_big > 0.4)
+			fx.impact_terrain(p, n, dir, _ground_color(p, n), false, hit_big > 0.4, impact_cal)
 		"metal":
-			fx.impact_metal(p, n, dir, false)
+			fx.impact_metal(p, n, dir, false, impact_cal)
 	return true
 
 
@@ -527,16 +714,21 @@ func _process(delta: float) -> void:
 	_use_t = maxf(_use_t - delta, 0.0)
 	var dt := minf(delta, 0.033)
 	var want := _ads_want and on
-	var k := 110.0 if want else 170.0
-	var c := 13.5 if want else 25.0
+	# (The attachments' aim speed s scales the spring's time: stiffness × s², damping × s.)
+	var asp: float = att_kit.ads_speed()
+	var k := (ads_k if want else 170.0) * asp * asp
+	var c := (ads_c if want else 25.0) * asp
 	_ads_vel += (((1.0 if want else 0.0) - ads) * k - _ads_vel * c) * dt
 	ads = clampf(ads + _ads_vel * dt, -0.05, 1.1)
-	sway_scale = lerpf(_hip_sway(), 0.45, clampf(ads, 0.0, 1.0))
+	sway_scale = lerpf(_hip_sway(), 0.45, clampf(ads, 0.0, 1.0)) * att_kit.stat("sway")
 	if reloading:
 		_tick_reload(delta)
+	_rc.tick(delta)
 	_recoil = _recoil.lerp(_recoil_target, 1.0 - exp(-60.0 * delta))
-	var rec := lerpf(10.5, 12.5, clampf(ads, 0.0, 1.0))
-	_recoil_target = _recoil_target.lerp(Vector2.ZERO, 1.0 - exp(-rec * delta))
+	# The kick holds for a moment (sustained fire climbs, learnable), then recovers on a spring.
+	if _since_shot > recoil_hold:
+		var rec := lerpf(10.5, 12.5, clampf(ads, 0.0, 1.0)) * recoil_recover * GunFeel.SNAP_RECOVER_K   # (2026-10-06 tok: slower)
+		_recoil_target = _recoil_target.lerp(Vector2.ZERO, 1.0 - exp(-rec * delta))
 	_roll_v += (-_roll * 420.0 - _roll_v * 26.0) * dt
 	_roll += _roll_v * dt
 	_trauma = maxf(_trauma - delta * 2.6, 0.0)
@@ -547,17 +739,25 @@ func _process(delta: float) -> void:
 	# Shots set _flash_t = 1 in the physics step; let that frame render at full strength first
 	# (decaying it here right away hid the flash at 60 fps and below).
 	_flash_t = maxf(_flash_t - delta / 0.05, 0.0) if _flash_t < 1.0 else 0.999
-	_rk_vel += (-_rk * 280.0 - _rk_vel * 21.0) * dt
+	_rk_vel += (-_rk * 340.0 - _rk_vel * 25.0) * dt     # gun recoil spring (weapon-feel pass: snappier)
 	_rk += _rk_vel * dt
 	_reload_w = move_toward(_reload_w, 1.0 if (reloading and _reload_pose_wanted()) else 0.0, dt / 0.22)
 	_update_fades(delta)
 	_tick(delta, on)
+	# The view climb (gun_feel.gd Climb): a heavy gun settles slower (recoil_recover / recoil_hold).
+	# (2026-10-06 tok: 6 × / + 0.05, at least 0.1 -> CLIMB_RECOVER 4.5 × / + 0.09, at least 0.14 s.)
+	_climb.recover = GunFeel.CLIMB_RECOVER * recoil_recover
+	_climb.hold = maxf(recoil_hold + 0.09, 0.14)
+	_climb.update(player, delta, on)
+	att_kit.tick(delta, on)                    # attachments: fit animation, laser, 4× overlay
 	if on:
 		_apply_camera()
 	else:
 		_restore_camera()
 	_update_pose(dt, on)
 	_animate_model(delta)
+	Handling.gun_post(self)                    # inspect: the left hand checks the magazine
+	att_kit.post()                             # fitting: the left hand on the mount
 
 
 func _hip_sway() -> float:
@@ -662,19 +862,40 @@ func _shell_events(_phase: int, _u: float) -> void:
 func _apply_camera() -> void:
 	var cam: Camera3D = player.camera
 	var e := _smooth(clampf(ads, 0.0, 1.0))
-	cam.fov = lerpf(Settings.fov, ads_fov * 1.0, e) + _fov_punch
+	var kick: float = float(player.get("fov_kick")) if player.get("fov_kick") != null else 0.0
+	# (The FOV punch shrinks with the zoom: a scope's view would jump.)
+	var fov := _cam_fov(e)
+	cam.fov = fov + _fov_punch * fov / maxf(Settings.fov, 1.0) + kick * (1.0 - e)
 	var sh := _trauma * _trauma
 	var shake := Vector3(sin(_t * 67.0) + sin(_t * 29.0) * 0.6, sin(_t * 59.0 + 1.3) + sin(_t * 19.0) * 0.5,
 			sin(_t * 43.0 + 0.7)) * sh * 0.016
-	var breath := Vector2(sin(_t * 1.1) * 0.0018 + sin(_t * 0.43) * 0.001, sin(_t * 0.8 + 1.0) * 0.0024) * e * 1.0
-	cam.rotation += Vector3(_recoil.x + shake.x + breath.y, _recoil.y + shake.y + breath.x, shake.z + _roll)
+	# Breathing sway while aiming (a foregrip steadies it, the 4× shows more of it).
+	var breath := Vector2(sin(_t * 1.1) * 0.0018 + sin(_t * 0.43) * 0.001, sin(_t * 0.8 + 1.0) * 0.0024) * e \
+			* att_kit.stat("sway") * (1.6 if att_kit.is_scope() else 1.0)
+	cam.rotation += Vector3(_recoil.x + shake.x + breath.y, _recoil.y + shake.y + breath.x, shake.z + _roll) + _cam_extra()
 	if Game.hud != null and Game.hud.get("crosshair") != null:
 		Game.hud.crosshair.modulate.a = 0.0
 	if "move_speed_mult" in player:
 		player.set("move_speed_mult", _move_mult(e))
 	if "look_scale" in player:
-		player.set("look_scale", lerpf(1.0, 0.75, e))
+		player.set("look_scale", _cam_look(e))
 	_cam_dirty = true
+
+
+## Camera FOV at aim weight e (0 hip .. 1 aimed): ads_fov, or the fitted optic's (attachments.gd: a
+## reflex / holo a little closer, the 4× in tan space). The sniper zooms its scope here.
+func _cam_fov(e: float) -> float:
+	return att_kit.cam_fov(e, ads_fov)
+
+
+## Mouse-look multiplier at aim weight e (the 4× scales it with the zoom).
+func _cam_look(e: float) -> float:
+	return att_kit.cam_look(e, ads_fov)
+
+
+## Extra camera rotation (pitch, yaw, roll) added every frame (the sniper's scope sway).
+func _cam_extra() -> Vector3:
+	return Vector3.ZERO
 
 
 func _move_mult(e: float) -> float:
@@ -725,7 +946,12 @@ func _hip_pose() -> Transform3D:
 
 
 ## Gun-frame point that the aim pose puts on the camera axis.
+## With an optic fitted its sight line goes on the axis (attachments.gd sight_y; the eye keeps its
+## distance behind the rear sight's spot).
 func sight_point() -> Vector3:
+	var oy: float = att_kit.sight_y()
+	if oy > 0.0:   # (a reflex / holo also comes closer to the eye: attachments.gd Kit.sight_z)
+		return Vector3(sight_rear.x, oy, att_kit.sight_z(sight_rear.z, ads_eye.z))
 	return sight_rear
 
 
@@ -751,41 +977,30 @@ func _update_pose(dt: float, on: bool) -> void:
 	if player == null:
 		return
 	var aim := clampf(ads, 0.0, 1.0)
-	var up: Vector3 = player.global_transform.basis.y
-	var vel: Vector3 = player.velocity
-	var v_up := vel.dot(up)
-	var hspeed := (vel - up * v_up).length()
-	var grounded: bool = player.is_on_floor()
-	var rate := 1.0 - exp(-10.0 * dt)
-	_sprint_w = move_toward(_sprint_w, 1.0 if (_sprint and on) else 0.0, dt / 0.22)
+	# Movement layer (gun_feel.gd Carry): the run pose weight and its stride sway, the walk bob, idle
+	# breathing, look sway, the jump / fall lift and the sprint-to-fire raise.
+	var look := _look_acc * (1.0 / 60.0) / maxf(dt, 0.001)     # per-frame mouse counts → 60 fps units
+	_look_acc = Vector2.ZERO
+	var sk := lerpf(1.0, 0.25, aim) * (0.6 if reloading else 1.0) * clampf(_hip_sway() / 1.6, 0.5, 1.6) * att_kit.stat("sway")
+	var style := GunFeel.sprint_style(self)
+	var mv := _carry.update(player, dt, _sprint and on, aim, look, sk, style)
+	_sprint_w = clampf(_carry.sprint, 0.0, 1.0)
 	var hip := _hip_pose()
 	var pose := _blend(hip, _ads_pose(), aim)
 	if ads > 1.0:
 		pose.origin = hip.origin.lerp(_ads_pose().origin, ads)
-	pose = _blend(pose, _pose_from(sprint_pos, sprint_rot), _smooth(_sprint_w))
+	pose = _blend(pose, GunFeel.sprint_pose(self, style), _smooth(_sprint_w))
 	pose = _blend(pose, _pose_from(reload_pos, reload_rot), _smooth(_reload_w))
-	var bob_target := clampf(hspeed / 4.5, 0.0, 1.6) if grounded else 0.0
-	_bob_amt = lerpf(_bob_amt, bob_target, rate * 0.6)
-	if grounded and player.get("astronaut") != null:
-		_bob_ph = float(player.astronaut._phase) * TAU + PI * 0.5     # the body's gait: dip as a foot plants
-	var bk := _bob_amt * (1.0 - aim * 0.85) * (1.0 + _sprint_w * 0.6)
-	var bob := Vector3(cos(_bob_ph) * 0.011, -absf(sin(_bob_ph)) * 0.014, 0.0) * bk
-	var bob_rot := Vector3(-absf(sin(_bob_ph)) * 0.01, cos(_bob_ph) * 0.012, cos(_bob_ph) * 0.022) * bk
-	var look := _look_acc * (1.0 / 60.0) / maxf(dt, 0.001)     # per-frame mouse counts → 60 fps units
-	_look_acc = Vector2.ZERO
-	var sk := lerpf(1.0, 0.25, aim) * (0.6 if reloading else 1.0) * clampf(_hip_sway() / 1.6, 0.5, 1.6)
-	var sway_target := Vector2(clampf(-look.x * 0.0013, -0.07, 0.07), clampf(-look.y * 0.0013, -0.06, 0.06)) * sk
-	_sway_vel += ((sway_target - _sway) * 160.0 - _sway_vel * 17.0) * dt
-	_sway += _sway_vel * dt
-	_vy = lerpf(_vy, clampf(-v_up * 0.006, -0.04, 0.05), rate * 0.5)
-	var breathe := Vector3(0.0, sin(_t * 1.6) * 0.0025, 0.0) * (1.0 - aim)
-	var off := bob + breathe + Vector3(_sway.x * 0.12, _sway.y * 0.1 + _vy * (1.0 - aim * 0.6), 0.0)
-	var rot := bob_rot + Vector3(_sway.y * 0.9, _sway.x * 1.1, _sway.x * 0.7)
-	var xf := Transform3D(Basis.from_euler(rot) * pose.basis, pose.origin + off)
-	var rk_rot := Basis.from_euler(Vector3(_rk.x, _rk.y, _rk.z))
+	var xf := GunFeel.apply_motion(pose, mv)
+	# Aimed, the camera carries the climb: the gun hardly turns (the sights stay on the reticle and the
+	# barrel never rises into view), it bucks back into the shoulder instead.
+	var rk_rot := Basis.from_euler(Vector3(_rk.x * (1.0 - 0.75 * aim), _rk.y * (1.0 - 0.55 * aim), _rk.z * (1.0 - 0.45 * aim)))
 	var rk_xf := Transform3D(Basis(), recoil_pivot) * Transform3D(rk_rot, Vector3.ZERO) * Transform3D(Basis(), -recoil_pivot)
-	rk_xf.origin += Vector3(0.0, 0.0, _rk.w)
-	pose_override = _pose_extra() * xf * rk_xf
+	rk_xf.origin += Vector3(0.0, 0.0, _rk.w * (1.0 - 0.35 * aim))
+	# Movement inertia (strafe cant, landing dip, slide cant) about the grip.
+	pose_override = GunFeel.apply_motion(_pose_extra() * xf * rk_xf, _motion.update(player, dt, aim))
+	pose_override = Handling.gun_pose(self, pose_override, dt, on)      # inspect (Y)
+	pose_override = att_kit.pose(pose_override)                         # fitting an attachment
 
 
 ## Model animation (parts, flash, reload choreography). Subclasses extend.
@@ -793,15 +1008,17 @@ func _animate_model(_delta: float) -> void:
 	if _flash_root != null:
 		_flash_root.visible = _flash_t > 0.0
 		if _flash_t > 0.0:
-			_flash_mat.set_shader_parameter("energy", 12.0 * _flash_t)
+			_flash_mat.set_shader_parameter("energy", 16.0 * _flash_t)
 
 
 func _randomize_flash(size: float) -> void:
 	if _flash_root == null:
 		return
-	_flash_root.scale = Vector3.ONE * randf_range(0.85, 1.3) * size
+	# Aimed: the flash sits far out at the muzzle, mostly behind the gun (smaller, MW-like).
+	_flash_root.scale = Vector3.ONE * randf_range(0.85, 1.3) * size * lerpf(1.0, 0.55, clampf(ads, 0.0, 1.0))
 	_flash_root.rotation.z = randf() * TAU
 	_flash_mat.set_shader_parameter("seed", randf() * 10.0)
+	_flash_mat.set_shader_parameter("spikes", float(randi_range(4, 6)))
 
 
 func _vm_world(n: Node3D) -> Vector3:
@@ -815,24 +1032,12 @@ func _ground_color(p: Vector3, n: Vector3) -> Color:
 	return Rifle.ground_color(p, n)
 
 
-## Muzzle flash quads (same star shader as the rifle), parented at `pos` in the gun frame.
+## Muzzle flash (same multi-quad ragged star as the rifle, Rifle.build_flash: two stars, two crossed
+## plumes × flash_long, a side flare), parented at `pos` in the gun frame.
 func _make_flash(parent: Node3D, pos: Vector3, size: float, col := Color(1.0, 0.62, 0.22)) -> void:
-	_flash_root = VM.node(parent, pos)
-	var fs := Shader.new()
-	fs.code = VM.prep(Rifle.FLASH_SHADER)
-	_flash_mat = ShaderMaterial.new()
-	_flash_mat.shader = fs
-	_flash_mat.set_shader_parameter("color", col)
-	var q := QuadMesh.new()
-	q.size = Vector2(0.17, 0.17) * size
-	var front := VM.mesh_inst(_flash_root, q, _flash_mat)
-	front.position = Vector3(0, 0, -0.02)
-	var side := QuadMesh.new()
-	side.size = Vector2(0.09, 0.26) * size
-	for k in 2:
-		var mi := VM.mesh_inst(_flash_root, side, _flash_mat)
-		mi.transform = Transform3D(Basis(Vector3.FORWARD, k * PI * 0.5) * Basis(Vector3.RIGHT, -PI * 0.5), Vector3(0, 0, -0.11 * size))
-	_flash_root.visible = false
+	var fr := Rifle.build_flash(parent, pos, size, col, flash_long)
+	_flash_root = fr[0]
+	_flash_mat = fr[1]
 
 
 ## Holographic sight on a rail (gun frame), its reticle dot on the line y = optic_y.
@@ -852,6 +1057,7 @@ func _build_tp_prop() -> void:
 		return
 	if ast.props.has(icon):
 		_tp_tip = ast.prop_tips.get(icon)
+		att_kit.build_tp(ast.props[icon], _tp_tip, ast)       # the fitted attachments on the prop
 		return
 	var hands: Array = ast.hand
 	if hands.size() < 2 or hands[1] == null:
@@ -868,6 +1074,7 @@ func _build_tp_prop() -> void:
 			list.append(mi)
 	if ast.has_method("set_first_person"):
 		ast.set_first_person(not player.is_ragdolled())
+	att_kit.build_tp(p, _tp_tip, ast)                         # the fitted attachments on the prop
 
 
 ## Builds the simplified third-person model under `p` (grip at the origin, -Z forward); returns the
@@ -890,7 +1097,7 @@ func _tp_mat(c: Color, rough: float, metal: float) -> StandardMaterial3D:
 
 func _setup_audio() -> void:
 	var bus := Rifle._weapons_bus()
-	for i in 12:
+	for i in 20:
 		var p := AudioStreamPlayer.new()
 		p.bus = bus
 		add_child(p)
@@ -899,9 +1106,15 @@ func _setup_audio() -> void:
 		var p := AudioStreamPlayer.new()
 		add_child(p)
 		_aux_audio.append(p)
-	# Recorded shots (assets/audio/sonniss/weap): 5.56 / 7.62 rifles, 12 gauge, .30 cal MG.
+	# Recorded shots (assets/audio/sonniss/weap): 5.56 / 7.62 rifles, 12 gauge, .30 cal MG. "heavy" is
+	# the weapon-feel pass's dense 7.62 report (weap/ar_heavy; the old short cuts until it is imported);
+	# "gtail" the rolling outdoor tail (_shot_body).
 	_snd["shot"] = Snd.set_of("weap/rifle_shot")
-	_snd["heavy"] = Snd.set_of("weap/rifle_heavy")
+	_snd["heavy"] = Snd.set_of("weap/ar_heavy")
+	_new_heavy = not (_snd["heavy"] as Array).is_empty()
+	if not _new_heavy:
+		_snd["heavy"] = Snd.set_of("weap/rifle_heavy")
+	_snd["gtail"] = Snd.set_of("weap/gtail")
 	_snd["shotgun"] = Snd.set_of("weap/shotgun")
 	_snd["mg"] = Snd.set_of("weap/mg")
 	if _synth.is_empty() and _synth_task < 0:
@@ -911,7 +1124,7 @@ func _setup_audio() -> void:
 func _build_synth() -> void:
 	var gen := ArsenalAudio.new()
 	var out := {}
-	for n in WeaponAudio.NAMES + ArsenalAudio.ARSENAL_NAMES:
+	for n in WeaponAudio.NAMES + ArsenalAudio.ARSENAL_NAMES + WeaponAudio.SNIPER_NAMES:
 		out[n] = [gen.make(n)]
 	_synth_mutex.lock()
 	_synth_ready = out
@@ -960,9 +1173,12 @@ func _play(name: String, vol := 0.0, pitch := 1.0, weapons_bus := false, cut := 
 	if weapons_bus:
 		p = _gun_audio[_gun_audio_i]
 		_gun_audio_i = (_gun_audio_i + 1) % _gun_audio.size()
+		p.bus = _sbus                          # "Weapons", or the suppressed bus during a suppressed shot
 	else:
 		p = _aux_audio[_aux_i]
 		_aux_i = (_aux_i + 1) % _aux_audio.size()
+		# Handling foley in vacuum: only what the suit conducts (muffled).
+		p.bus = "VacSuit" if GunFeel.in_vacuum() else "Master"
 	p.stream = st
 	p.volume_db = vol
 	p.pitch_scale = pitch
@@ -997,8 +1213,14 @@ func _update_fades(delta: float) -> void:
 	_fades = keep
 
 
-## Open air / tunnel for the reverb (same rules as the rifle).
+## Open air / tunnel for the reverb (same rules as the rifle); 3 = vacuum (no air: no crack, tail
+## or echo, only the suit-borne thump).
 func _space_kind() -> int:
+	if GunFeel.in_vacuum():
+		return 3
+	var ac = Game.sfx.get("acoustics") if Game.sfx != null and is_instance_valid(Game.sfx) else null
+	if ac != null and is_instance_valid(ac):
+		return int(ac.space_kind())          # the measured room (scripts/audio/acoustics.gd)
 	if player == null:
 		return 2
 	var hd: Vector3 = player.camera.global_position
@@ -1010,6 +1232,8 @@ func _space_kind() -> int:
 
 
 func _set_space(kind: int) -> void:
+	if Game.sfx != null and is_instance_valid(Game.sfx) and Game.sfx.get("acoustics") != null:
+		return                               # acoustics.gd sizes the Weapons reverb continuously
 	var idx := AudioServer.get_bus_index("Weapons")
 	if idx < 0:
 		return
@@ -1018,7 +1242,7 @@ func _set_space(kind: int) -> void:
 		if rv == null:
 			continue
 		match kind:
-			0:
+			0, 3:
 				rv.room_size = 0.25
 				rv.wet = 0.05
 				rv.predelay_msec = 12.0

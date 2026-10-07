@@ -20,6 +20,7 @@ const DigFx := preload("res://scripts/items/dig_fx.gd")
 const Snd := preload("res://scripts/audio/snd_lib.gd")
 const Settings := preload("res://scripts/save/settings.gd")
 const UI := preload("res://scripts/ui/ui_style.gd")
+const Foundation := preload("res://scripts/war/foundation.gd")
 
 const TRUNNION_Y := 1.75             # pivot height of the cradle above the pad
 const BARREL_LEN := 5.6
@@ -38,6 +39,10 @@ var pitch := deg_to_rad(45.0)         # current, rad above the horizon
 var charge := 0.55                    # 0..1 between CANNON_SPEED_MIN and MAX
 var reload_t := 0.0
 var is_destroyed := false
+## Free shells (2026-10-06 "küçük vergileri kaldır"): one more every CANNON_FREE_RELOAD s, up to
+## CANNON_FREE_MAX; a player's shot uses one before it pays SHELL_COST (end of file).
+var free_shells := Balance.CANNON_FREE_MAX
+var _free_t := 0.0
 
 var _yaw_t := 0.0
 var _pitch_t := deg_to_rad(45.0)
@@ -72,6 +77,7 @@ var _build_t := -1.0
 var _parts: Array = []                # [node, rest transform, delay] for the assembly animation
 var _ground_check := false
 var _turning := 0.0
+var _foundation: Node3D               # skirt / piles down to the real ground (scripts/war/foundation.gd)
 
 
 ## Builds a cannon of `team` on `body` at `xf` (basis y = up), under `parent`.
@@ -93,6 +99,10 @@ func _ready() -> void:
 	add_to_group("war_cannon")
 	set_meta("footprint_r", Balance.CANNON_FOOTPRINT)
 	_build_model()
+	if body != null and not has_meta("build_preview"):
+		var fs := _foundation_shape()
+		_foundation = Foundation.create(self, body, fs[0], fs[1], fs[2])
+		_parts.append([_foundation, _foundation.transform, 0.0])
 	_build_audio()
 	_font = UI.font(500)
 	_font_b = UI.font(700)
@@ -285,13 +295,14 @@ func _build_audio() -> void:
 
 ## Parts drop / rise into place over ~1.4 s (spawned by the build tool or the AI).
 func begin_assembly() -> void:
+	# The print (build_fx.gd) measures the whole model first, then the parts drop in through it.
+	BuildFx.assemble(get_parent(), global_transform, Vector3(2.4, 1.6, 2.4), BuildFx.AUTO, self)
 	_build_t = 0.0
 	for p in _parts:
 		var n: Node3D = p[0]
 		n.transform = (p[1] as Transform3D).translated_local(Vector3(0, 2.5, 0))
 		n.scale = Vector3.ONE * 0.6
 		n.visible = false
-	BuildFx.assemble(get_parent(), global_transform, Vector3(2.4, 1.6, 2.4))
 
 
 # =================================================================================================
@@ -336,10 +347,13 @@ func fire(paid := false, on_impact := Callable()) -> bool:
 		if pilot != null and Game.sfx:
 			Game.sfx.play("click", -8.0, 0.7)
 		return false
-	if not paid and not Game.spend_material(Balance.SHELL_COST):
+	var free := not paid and free_shells > 0      # a free shell first (end of file)
+	if free:
+		free_shells -= 1
+	elif not paid and not Game.spend_material(Balance.SHELL_COST):
 		if pilot != null:
 			if Game.hud:
-				Game.hud.show_message("Yetersiz malzeme — mermi %d m³" % int(Balance.SHELL_COST), 2.0)
+				Game.hud.show_message("Yetersiz malzeme — mermi %d m³ (bedava mermi %d sn sonra)" % [int(Balance.SHELL_COST), int(ceilf(free_shell_wait()))], 2.0)
 			if Game.sfx:
 				Game.sfx.play("error", -10.0)
 		return false
@@ -363,6 +377,27 @@ func fire(paid := false, on_impact := Callable()) -> bool:
 		if d < 60.0:
 			pl.add_trauma(0.4 * (1.0 - d / 60.0))
 	return true
+
+
+## Multiplayer: the other peer fired this cannon; the look and sound of it (the shell comes as its
+## own event, scripts/net/net_world.gd).
+func net_fire_fx() -> void:
+	reload_t = Balance.CANNON_RELOAD
+	var dir := barrel_dir()
+	_recoil_v = 7.5
+	_flash_t = 1.0
+	_muzzle_smoke(muzzle_position(), dir)
+	BuildFx.dust(get_parent(), global_position, global_transform.basis.y, 3.0, Color(0.55, 0.5, 0.42))
+	_audio.pitch_scale = randf_range(0.92, 1.02)
+	_audio.play()
+	_boom_low.pitch_scale = randf_range(0.55, 0.65)
+	_boom_low.volume_db = -4.0
+	_boom_low.play()
+	var pl = Game.player
+	if pl != null and is_instance_valid(pl) and pl.has_method("add_trauma"):
+		var d: float = pl.global_position.distance_to(global_position)
+		if d < 60.0:
+			pl.add_trauma(0.4 * (1.0 - d / 60.0))
 
 
 func _muzzle_smoke(pos: Vector3, dir: Vector3) -> void:
@@ -401,6 +436,7 @@ func _muzzle_smoke(pos: Vector3, dir: Vector3) -> void:
 
 
 func _process(delta: float) -> void:
+	_free_regen(delta)
 	# Assembly.
 	if _build_t >= 0.0:
 		_build_t += delta
@@ -457,11 +493,13 @@ func get_interact_prompt() -> String:
 		return ""
 	if _build_t >= 0.0:
 		return "Top kuruluyor…"
+	if has_meta("net_busy"):
+		return "Top dolu — arkadaşın kullanıyor"
 	return "Topa geç"
 
 
 func interact(p) -> void:
-	if team != "home" or _build_t >= 0.0 or is_destroyed:
+	if team != "home" or _build_t >= 0.0 or is_destroyed or has_meta("net_busy"):
 		return
 	p.enter_vehicle(self)
 
@@ -568,8 +606,8 @@ func _make_preview_nodes() -> void:
 	_arc.global_transform = Transform3D.IDENTITY
 	# Impact ring (crater size) and a small always-visible marker.
 	var tm := TorusMesh.new()
-	tm.inner_radius = Balance.SHELL_CRATER_R - 0.6
-	tm.outer_radius = Balance.SHELL_CRATER_R
+	tm.inner_radius = Balance.SHELL_CRATER_R * Balance.CRATER_SCALE - 0.6     # the carved size
+	tm.outer_radius = Balance.SHELL_CRATER_R * Balance.CRATER_SCALE
 	tm.rings = 48
 	tm.ring_segments = 6
 	var rm := StandardMaterial3D.new()
@@ -648,6 +686,7 @@ func _target_kind() -> String:
 
 func _make_overlay() -> void:
 	_overlay = CanvasLayer.new()
+	_overlay.add_to_group("gameplay_overlay")     # hidden on the end screen / menus (overlay_guard.gd)
 	_overlay.layer = 7
 	add_child(_overlay)
 	_ov = Control.new()
@@ -690,7 +729,9 @@ func _draw_overlay() -> void:
 			c2 = UI.BAD
 	_text(o + Vector2(18, 56), l2, 15, c2, _font_b)
 	var rl := "HAZIR" if reload_t <= 0.0 else "DOLDURULUYOR %.1f sn" % reload_t
-	_text(o + Vector2(18, 82), "%s   ·   mermi %d m³   ·   malzeme %d m³" % [rl, int(Balance.SHELL_COST), int(Game.material)],
+	var ammo_s := "bedava mermi %d/%d" % [free_shells, Balance.CANNON_FREE_MAX] if free_shells > 0 \
+			else "bedava mermi %d sn · şimdi %d m³" % [int(ceilf(free_shell_wait())), int(Balance.SHELL_COST)]
+	_text(o + Vector2(18, 82), "%s   ·   %s   ·   malzeme %d m³" % [rl, ammo_s, int(Game.material)],
 			13, UI.DIM if reload_t > 0.0 else UI.TEXT, _font)
 	var bar := Rect2(o + Vector2(18, 90), Vector2(w - 36, 4))
 	_ov.draw_rect(bar, Color(1, 1, 1, 0.08))
@@ -749,19 +790,62 @@ func _on_brush(center: Vector3, r: float) -> void:
 		_settle.call_deferred()
 
 
+## It sinks only when under a quarter of its base still has ground (Foundation.support_drop; never up: the
+## old centre-only probe lifted a pad placed on a slope onto the uphill ground at the first dig
+## nearby, leaving its low side in the air); the foundation then refits to the new ground.
 func _settle() -> void:
 	await get_tree().create_timer(1.2).timeout      # let the crater finish carving
 	_ground_check = false
 	if is_destroyed or body == null or not is_inside_tree():
 		return
 	var up: Vector3 = global_transform.basis.y.normalized()
-	var hit: Dictionary = body.raycast_density(global_position + up * 2.0, global_position - up * 40.0, 0.5)
-	if hit.is_empty():
-		return
-	var drop: float = global_position.distance_to(hit["position"])
+	var fs := _foundation_shape()
+	var pts: PackedVector3Array = fs[0]
+	pts.append(Vector3(0, -0.2, 0))
+	var drop := Foundation.support_drop(self, body, pts)
 	if drop > 0.4:
 		var land := func() -> void:
 			BuildFx.dust(get_parent(), global_position, up, 3.0, Color(0.5, 0.45, 0.38))
+			_refit_foundation()
 		var tw := create_tween()
-		tw.tween_property(self, "global_position", hit["position"], clampf(sqrt(drop) * 0.3, 0.2, 1.2)).set_ease(Tween.EASE_IN).set_trans(Tween.TRANS_QUAD)
+		tw.tween_property(self, "global_position", global_position - up * drop, clampf(sqrt(drop) * 0.3, 0.2, 1.2)).set_ease(Tween.EASE_IN).set_trans(Tween.TRANS_QUAD)
 		tw.tween_callback(land)
+	else:
+		_refit_foundation()
+
+
+## Foundation (scripts/war/foundation.gd): [outline the skirt hangs from, [pile point, radius]...,
+## skirt colour], local. The cannon: the octagonal footing (inside its bottom edge) and a pile under
+## each outrigger spade. The buster overrides it.
+func _foundation_shape() -> Array:
+	var piles: Array = []
+	for i in 4:
+		var a := TAU * float(i) / 4.0 + PI * 0.25
+		piles.append([Vector3(-3.35 * sin(a), -0.08, -3.35 * cos(a)), 0.12])
+	return [Foundation.polygon(8, 2.44, -0.15), piles, Color(0.36, 0.35, 0.33)]
+
+
+func _refit_foundation() -> void:
+	if _foundation != null and is_instance_valid(_foundation):
+		_foundation.refit(true)
+
+
+# =================================================================================================
+# Free shells (2026-10-06 "küçük vergileri kaldır"; balance.gd CANNON_FREE_*): fire() uses one before
+# it pays SHELL_COST; one comes back every CANNON_FREE_RELOAD s. (The AI fires paid shells from its
+# pool, as before; the Delici Top overrides fire() and keeps its own price.)
+# =================================================================================================
+
+func _free_regen(delta: float) -> void:
+	if free_shells >= Balance.CANNON_FREE_MAX:
+		_free_t = 0.0
+		return
+	_free_t += delta
+	if _free_t >= Balance.CANNON_FREE_RELOAD:
+		_free_t = 0.0
+		free_shells += 1
+
+
+## Seconds until the next free shell (0 when full).
+func free_shell_wait() -> float:
+	return 0.0 if free_shells >= Balance.CANNON_FREE_MAX else maxf(Balance.CANNON_FREE_RELOAD - _free_t, 0.0)

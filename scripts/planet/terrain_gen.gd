@@ -28,6 +28,7 @@ const WARP_O2 := Vector3(-73.9, 112.6, -41.3)    # warp components (same constan
 const COLLISION_LOD := 1
 const FOLIAGE_LOD := 2
 const DETAIL_LOD := 0        # cave flora only on the finest chunks
+const SKIRT_REACH := 2       # cells past the grid a skirt end may be tested (planet.gd SKIRT_REACH)
 const EDGE_SHIFT := 17
 const EDGE_MASK := (1 << EDGE_SHIFT) - 1
 const CAVE_MAX_DEPTH := 80.0 # (gpu_density.gd repeats it)
@@ -368,7 +369,7 @@ func build_chunk(origin: Vector3i, lod: int, edit_regions: Dictionary) -> Dictio
 			if mind > void_margin(lod):
 				result["void"] = true
 		return result
-	return mesh_from_density(dens, origin, lod, has_edits)
+	return mesh_from_density(dens, origin, lod, has_edits, edit_regions)
 
 
 ## Overrides base densities (e.g. from the GPU) with player edits. Returns true when the grid holds
@@ -398,7 +399,8 @@ func merge_edits(dens: PackedFloat32Array, origin: Vector3i, lod: int, edit_regi
 
 
 ## Surface Nets + attributes + flora from a sampled density grid (S^3 samples).
-func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has_edits: bool) -> Dictionary:
+func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has_edits: bool,
+		edit_regions: Dictionary = {}) -> Dictionary:
 	no_caves = lod >= 2
 	var step := 1 << lod
 	var cell := float(step) * VOXEL
@@ -411,6 +413,7 @@ func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has
 	cell_vert.fill(-1)
 	var verts := PackedVector3Array()
 	var norms := PackedVector3Array()
+	var vborder := PackedByteArray()     # per vertex: 1/2 x first/last cell, 4/8 y, 16/32 z (skirts)
 	for z in C:
 		for y in C:
 			for x in C:
@@ -484,9 +487,26 @@ func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has
 				cell_vert[x + y * C + z * CC] = verts.size()
 				verts.append(lp * cell)
 				norms.append(n.normalized())
+				vborder.append((1 if x == 0 else (2 if x == N else 0)) | (4 if y == 0 else (8 if y == N else 0))
+						| (16 if z == 0 else (32 if z == N else 0)))
 
 	if verts.is_empty():
 		return result
+
+	# Coarse chunks (the other planet across the gap, far slopes): the one-cell gradient above gives
+	# faceted, blotchy shading at 2+ m cells. Blend in a two-cell central difference (trilinear in
+	# the grid) for smoother normals; the near LOD0 ground keeps its crisp one-cell normals.
+	if lod >= 1:
+		var ex := Vector3(cell, 0.0, 0.0)
+		var ey := Vector3(0.0, cell, 0.0)
+		var ez := Vector3(0.0, 0.0, cell)
+		for vi in verts.size():
+			var p := verts[vi]
+			var g := Vector3(_grid_density(dens, p + ex, cell) - _grid_density(dens, p - ex, cell),
+					_grid_density(dens, p + ey, cell) - _grid_density(dens, p - ey, cell),
+					_grid_density(dens, p + ez, cell) - _grid_density(dens, p - ez, cell))
+			if g.length_squared() > 1e-12:
+				norms[vi] = (norms[vi] + g.normalized() * 1.5).normalized()
 
 	# --- 3. Quads for every sign-changing grid edge ---------------------------------------
 	_idx = PackedInt32Array()
@@ -570,24 +590,67 @@ func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has
 			result["colliders"] = _colliders(result)
 
 	# --- 7. Skirts on open chunk borders to hide cracks between different LODs ------------
-	var skirt_len := cell * 1.3
+	# Surface Nets puts each vertex INSIDE its cell, so a mesh starts up to one of its own cells
+	# inside the chunk's min faces and ends up to one cell past its max faces. Same-LOD neighbours
+	# share that border row (seamless); at an LOD seam the coarse side may start a whole coarse cell
+	# in while the fine side stops just past the face: an open strip up to a coarse cell wide.
+	# Skirts hanging straight down (-normal) leave that strip open when it is seen face-on (the
+	# other planet from afar, a skiff approaching it) and the camera looks into the back-face-culled
+	# inside of the ball: stars. So every skirt vertex also steps one of its own cells outward
+	# across the chunk face, in the tangent plane, while it dips: the coarser side of any seam then
+	# covers the strip from above whatever the LOD difference; the dip (>= ~52°, so it stays under
+	# the neighbour on crater rims) covers the height mismatch seen from the side. One skirt vertex
+	# per border vertex, shared by its two border edges; double-sided.
+	# A skirt must end INSIDE the ground: on a dug overhang (a pit's undercut wall, a tunnel ceiling:
+	# the normal points down) "-normal" goes up through the thin roof and the double-sided skirt
+	# stuck out of the ground as a big flat sheet beside the pit. So the end is checked against this
+	# chunk's own density grid and pulled back (60 %, 30 %, else no skirt) until it is in solid.
+	var skirt_depth := cell * (1.3 if lod == 0 else 2.0)
+	var skirt_of := PackedInt32Array()
+	skirt_of.resize(nv)
+	skirt_of.fill(-1)
+	var border_edges := PackedInt64Array()
 	for key in _edges:
 		if _edges[key] != 1:
 			continue
-		var a: int = key >> EDGE_SHIFT
-		var b: int = key & EDGE_MASK
-		var a2 := verts.size()
-		var b2 := a2 + 1
-		verts.append(verts[a] - norms[a] * skirt_len)
-		norms.append(norms[a])
-		colors.append(colors[a])
-		uvs.append(uvs[a])
-		uv2s.append(uv2s[a])
-		verts.append(verts[b] - norms[b] * skirt_len)
-		norms.append(norms[b])
-		colors.append(colors[b])
-		uvs.append(uvs[b])
-		uv2s.append(uv2s[b])
+		border_edges.append(key)
+		skirt_of[key >> EDGE_SHIFT] = 0
+		skirt_of[key & EDGE_MASK] = 0
+	for vi in nv:
+		if skirt_of[vi] < 0:
+			continue
+		var n := norms[vi]
+		var p := verts[vi]
+		var dip := skirt_depth
+		var m := vborder[vi]
+		if m != 0:
+			var o := Vector3(float((m >> 1) & 1) - float(m & 1), float((m >> 3) & 1) - float((m >> 2) & 1),
+					float((m >> 5) & 1) - float((m >> 4) & 1)).normalized()
+			var t := o - n * o.dot(n)
+			var l2 := t.length_squared()
+			if l2 > 0.09:
+				# One cell across the face (capped where the surface runs almost along the face).
+				var s := cell / sqrt(maxf(l2, 0.36))
+				p += t * (s / sqrt(l2))
+				dip = maxf(dip, s * 1.3)
+		var v0 := verts[vi]
+		var off := p - n * dip - v0
+		var end := v0
+		for k: float in [1.0, 0.6, 0.3]:
+			if _skirt_density(dens, v0 + off * k, cell, world_origin, edit_regions) < 0.0:
+				end = v0 + off * k
+				break
+		skirt_of[vi] = verts.size()
+		verts.append(end)
+		norms.append(n)
+		colors.append(colors[vi])
+		uvs.append(uvs[vi])
+		uv2s.append(uv2s[vi])
+	for key in border_edges:
+		var a := int(key >> EDGE_SHIFT)
+		var b := int(key & EDGE_MASK)
+		var a2 := skirt_of[a]
+		var b2 := skirt_of[b]
 		_idx.append_array(PackedInt32Array([a, b, b2, a, b2, a2, a, b2, b, a, a2, b2]))
 
 	result["empty"] = false
@@ -598,6 +661,43 @@ func mesh_from_density(dens: PackedFloat32Array, origin: Vector3i, lod: int, has
 	result["uv2s"] = uv2s
 	result["indices"] = _idx
 	return result
+
+
+## Density at chunk-local lp (m) for the skirt test: the chunk's grid (trilinear) inside it, else
+## the edit at the nearest voxel (edit_regions covers SKIRT_REACH cells past the grid: planet.gd
+## _edits_for) or the generator; farther out "air" (the caller pulls the skirt back).
+func _skirt_density(dens: PackedFloat32Array, lp: Vector3, cell: float, world_origin: Vector3,
+		edit_regions: Dictionary) -> float:
+	var g := lp / cell
+	var top := float(S - 1)
+	if g.x >= 0.0 and g.y >= 0.0 and g.z >= 0.0 and g.x <= top and g.y <= top and g.z <= top:
+		return _grid_density(dens, lp, cell)
+	if g.x < -SKIRT_REACH or g.y < -SKIRT_REACH or g.z < -SKIRT_REACH \
+			or g.x > top + SKIRT_REACH or g.y > top + SKIRT_REACH or g.z > top + SKIRT_REACH:
+		return 1.0
+	var w := world_origin + lp
+	if not edit_regions.is_empty():
+		var v := Vector3i((w / VOXEL).round())
+		var region = edit_regions.get(Vector3i(v.x >> 4, v.y >> 4, v.z >> 4))
+		if region != null:
+			var e: float = region[(v.x & 15) | ((v.y & 15) << 4) | ((v.z & 15) << 8)]
+			if e < NO_EDIT * 0.5:
+				return e
+	return density_base(w)
+
+
+## Trilinear density of a chunk's sample grid (S³, spacing `cell`) at chunk-local position lp (m),
+## clamped into the grid (a point just past a chunk face reads the face).
+static func _grid_density(dens: PackedFloat32Array, lp: Vector3, cell: float) -> float:
+	var g := (lp / cell).clamp(Vector3.ZERO, Vector3.ONE * (float(S - 1) - 0.001))
+	var i := Vector3i(g.floor())
+	var f := g - Vector3(i)
+	var b := i.x + i.y * S + i.z * SS
+	var c00 := lerpf(dens[b], dens[b + 1], f.x)
+	var c10 := lerpf(dens[b + S], dens[b + S + 1], f.x)
+	var c01 := lerpf(dens[b + SS], dens[b + SS + 1], f.x)
+	var c11 := lerpf(dens[b + SS + S], dens[b + SS + S + 1], f.x)
+	return lerpf(lerpf(c00, c10, f.y), lerpf(c01, c11, f.y), f.z)
 
 
 ## Rocks, the preset's flora list ([kind, density, tint, min scale, max scale, detail only]) and

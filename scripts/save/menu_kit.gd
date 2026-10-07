@@ -33,14 +33,7 @@ static var _spaced := {}
 
 ## Bold font with extra letter spacing for headings.
 static func spaced_font(weight: int, spacing: int) -> Font:
-	var key := "%d_%d" % [weight, spacing]
-	if _spaced.has(key):
-		return _spaced[key]
-	var f := FontVariation.new()
-	f.base_font = UI.font(weight)
-	f.spacing_glyph = spacing
-	_spaced[key] = f
-	return f
+	return UI.font_caps(weight, spacing)          # (the design system's cache)
 
 
 static func heading(parent: Node, text: String, size: int, color: Color, spacing := 3, weight := 700) -> Label:
@@ -62,29 +55,27 @@ static func backdrop(parent: Node) -> ColorRect:
 	return r
 
 
+## The design system's plate (scripts/ui/ui_style.gd chamfer_box: the top-left and bottom-right
+## corners cut by `radius`) with an accent bar along the left edge.
 static func _sb(bg: Color, bar: Color, bar_w: int, radius := 8) -> StyleBoxFlat:
-	var s := StyleBoxFlat.new()
-	s.bg_color = bg
-	s.set_corner_radius_all(radius)
-	s.border_color = bar
+	var s := UI.chamfer_box(bg, bar, 0, float(radius), 0)
 	s.border_width_left = bar_w
-	s.set_content_margin_all(0)
-	s.anti_aliasing = true
-	s.corner_detail = 6
 	return s
 
 
 ## Wide menu button: title, optional second line and key hint. `danger` tints the accent red.
+## Glass plate; hover / focus: brighter glass, the suit's orange bar on the left (danger: red).
 static func menu_button(parent: Node, title: String, key := "", sub := "", width := 380.0, danger := false) -> Button:
-	var accent: Color = UI.BAD if danger else UI.CYAN
+	var accent: Color = UI.BAD if danger else UI.SUIT_ORANGE
 	var b := Button.new()
 	b.focus_mode = Control.FOCUS_ALL
 	b.custom_minimum_size = Vector2(width, 66.0 if sub != "" else 50.0)
-	b.add_theme_stylebox_override("normal", _sb(Color(0.05, 0.08, 0.12, 0.38), accent, 0))
-	b.add_theme_stylebox_override("hover", _sb(Color(0.1, 0.16, 0.23, 0.88), accent, 3))
-	b.add_theme_stylebox_override("pressed", _sb(Color(0.15, 0.24, 0.32, 0.95), accent, 3))
-	b.add_theme_stylebox_override("focus", _sb(Color(0.1, 0.16, 0.23, 0.0), accent, 3))
-	b.add_theme_stylebox_override("disabled", _sb(Color(0.04, 0.06, 0.09, 0.25), accent, 0))
+	b.add_theme_stylebox_override("normal", _sb(Color(UI.GLASS, 0.42), accent, 0))
+	b.add_theme_stylebox_override("hover", _sb(Color(UI.GLASS_HI, 0.88), accent, 3))
+	b.add_theme_stylebox_override("pressed", _sb(Color(accent.darkened(0.55), 0.9), accent, 3))
+	b.add_theme_stylebox_override("hover_pressed", _sb(Color(accent.darkened(0.55), 0.9), accent, 3))
+	b.add_theme_stylebox_override("focus", _sb(Color(UI.GLASS_HI, 0.0), accent, 3))
+	b.add_theme_stylebox_override("disabled", _sb(Color(UI.GLASS, 0.22), accent, 0))
 	var hb := UI.hbox(b, 10)
 	hb.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	hb.offset_left = 22
@@ -92,7 +83,7 @@ static func menu_button(parent: Node, title: String, key := "", sub := "", width
 	var vb := UI.vbox(hb, 1)
 	vb.alignment = BoxContainer.ALIGNMENT_CENTER
 	vb.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var tl := UI.label(vb, title, 19, Color(0.86, 0.91, 0.97), 600)
+	var tl := UI.label(vb, title, 19, UI.TEXT, 600)
 	var sl: Label = null
 	if sub != "":
 		sl = UI.label(vb, sub, 13, UI.DIM)
@@ -109,7 +100,7 @@ static func menu_button(parent: Node, title: String, key := "", sub := "", width
 	var lit := func(on: bool) -> void:
 		if not is_instance_valid(b) or b.disabled:
 			return
-		tl.add_theme_color_override("font_color", Color(1, 1, 1) if on else Color(0.86, 0.91, 0.97))
+		tl.add_theme_color_override("font_color", Color(1.0, 0.99, 0.97) if on else UI.TEXT)
 		var tw := b.create_tween()
 		tw.tween_property(hb, "offset_left", 30.0 if on else 22.0, 0.12).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 	b.focus_entered.connect(lit.bind(true))

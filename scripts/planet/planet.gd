@@ -32,6 +32,7 @@ const TerrainGen := preload("res://scripts/planet/terrain_gen.gd")
 const GpuService := preload("res://scripts/planet/gpu_service.gd")
 const FloraMeshes := preload("res://scripts/planet/flora_meshes.gd")
 const Bodies := preload("res://scripts/planet/bodies.gd")
+const WarBalance := preload("res://scripts/war/balance.gd")   # CRATER_SCALE (crater())
 const FloraDebris := preload("res://scripts/planet/flora_debris.gd")
 const TerrainTextures := preload("res://scripts/planet/terrain_textures.gd")
 const DEBRIS_DIST := 70.0                    # rocks removed by digging closer than this tumble into the pit
@@ -44,8 +45,11 @@ const SPLIT_K := 1.7                         # node splits when camera is closer
 const KEEP_K := 2.4                          # hidden built chunks are cached while the parent is this close
 const REGEN_MAX_LOD := 3                     # default: edits re-mesh chunks up to this LOD (cfg "regen_max_lod")
 const EDIT_CLAMP := 4.0
-const CRATER_MAX_R := 12.0                   # crater() radius cap (m)
-const CRATER_BUDGET_USEC := 3000             # crater() main-thread time per frame
+const SKIRT_REACH := TerrainGen.SKIRT_REACH  # cells past a chunk's grid its skirts may reach (_edits_for)
+const CRATER_MAX_R := 22.0                   # crater() radius cap (m, after CRATER_SCALE)
+const CRATER_CORE_K := 0.55                  # big craters: the core (this × r) carves and re-meshes first
+const SURF_Q := 96.0                         # crater carve: surface-sample cache cells per radian (~0.6 m at R 60; 48 at R 30)
+const CRATER_BUDGET_USEC := 4000             # crater() main-thread time per frame (a 5.5 m crater: ~2-4 frames)
 const APPLY_BUDGET_USEC := 2500              # main-thread time per frame for applying finished chunks
 const LOD0_COLLISION_DIST := 48.0            # collision shapes are built only this close to the camera
 const LOD1_COLLISION_DIST := 45.0            # (LOD1: only while displayed, e.g. vehicles behind a look-ahead focus)
@@ -96,6 +100,8 @@ class Chunk:
 signal brush_applied(center: Vector3, radius: float)
 ## Emitted when a crater() has been fully carved: world centre, radius, soil removed (m³).
 signal crater_done(center: Vector3, radius: float, soil: float)
+## Emitted when a crater() is queued (after the scale and the multiplayer hook): world centre, radius.
+signal crater_started(center: Vector3, radius: float)
 
 ## Body preset (bodies.gd PRESETS key) and optional overrides (radius, seed, ...). Set before _ready.
 var preset := "home"
@@ -194,8 +200,12 @@ var _cam_fwd := Vector3.ZERO
 var _wind := 1.0
 var _debris: Node3D                         # flora_debris.gd: falling trees, tumbling rocks
 var _recent_brush: Array = []               # [center (body-local), radius, usec] of recent digs
+var _push_zones: Array = []                 # [center (body-local), radius, velocity (world), usec]: add_push_zone
 ## Craters being carved slice by slice (crater()): {c, r, amount, z, lo, hi, soil, world}.
 var _craters: Array = []
+## Multiplayer (scripts/net/net_terrain.gd): sees every apply_brush / crater first and returns the
+## float32-rounded arguments to apply (or [] to drop it). null in single player.
+static var net_hook: Object = null
 
 ## Debug counters (read by tests/bench_planet.gd).
 var stat_applied := 0
@@ -228,7 +238,7 @@ func _ready() -> void:
 	detail_lod = int(cfg.get("detail_lod", 0))
 	detail_dist = float(cfg.get("detail_dist", 0.0))
 	soil_color = cfg.get("soil_color", soil_color)
-	soi_radius = radius * 3.0
+	soi_radius = radius * 2.5          # (R 60, 350 m apart: the two spheres must not overlap)
 	if config_overrides.has("auto_focus"):
 		auto_focus = bool(config_overrides["auto_focus"])
 	# Smallest root that still encloses the body.
@@ -363,6 +373,15 @@ func set_wind(strength: float) -> void:
 ## (m³): positive = dug out (solid -> air), negative = placed (air -> solid).
 func apply_brush(center: Vector3, radius: float, mode: int, amount: float,
 		plane_point := Vector3.ZERO, plane_normal := Vector3.UP) -> float:
+	if net_hook != null:
+		var q: Array = net_hook.on_brush(self, center, radius, mode, amount, plane_point, plane_normal)
+		if q.is_empty():
+			return 0.0
+		center = q[0]
+		radius = q[1]
+		amount = q[2]
+		plane_point = q[3]
+		plane_normal = q[4]
 	# Callers pass world-space points; the voxel grid is relative to this body's centre.
 	var c := center - global_position
 	var lo := Vector3i((c - Vector3.ONE * (radius + 1.0)).floor())
@@ -372,17 +391,62 @@ func apply_brush(center: Vector3, radius: float, mode: int, amount: float,
 	return soil
 
 
+## A shock wave tears the ground here (kinetic pusher, scripts/items/kinetic_pusher.gd): rocks and
+## trees whose ground disappears within `radius` of `center` (world) in the next ~2 s are thrown
+## along `vel` (world, m/s) instead of tumbling into the pit (flora_debris.gd launch_flora). Purely
+## visual: every machine registers it for the blasts it sees.
+func add_push_zone(center: Vector3, radius: float, vel: Vector3) -> void:
+	_push_zones.append([center - global_position, radius, vel, Time.get_ticks_usec()])
+	if _push_zones.size() > 12:
+		_push_zones.pop_front()
+
+
+## Throw velocity of a recent push zone containing body-local point p, or ZERO.
+func _push_at(p: Vector3) -> Vector3:
+	var now := Time.get_ticks_usec()
+	for i in range(_push_zones.size() - 1, -1, -1):
+		var z: Array = _push_zones[i]
+		if now - int(z[3]) > 2000000:
+			continue
+		if p.distance_to(z[0]) < float(z[1]):
+			return z[2]
+	return Vector3.ZERO
+
+
 ## Carves a crater (a DIG brush, cannonball impacts) over the next frames instead of at once: the
 ## voxel loop runs in z slices under CRATER_BUDGET_USEC per frame, then the chunks re-mesh once.
-## radius is capped at CRATER_MAX_R; depth (m at the centre) defaults to ~1.2 x radius. Emits
+## radius (× Balance.CRATER_SCALE) is capped at CRATER_MAX_R; depth (m at the centre, × CRATER_SCALE)
+## defaults to ~1.2 x radius. Emits
 ## brush_applied when done and crater_done(center, radius, soil m³).
 func crater(center: Vector3, radius: float, depth := -1.0) -> void:
+	# Every explosive crater is carved WarBalance.CRATER_SCALE bigger (radius and depth) — but not
+	# when the multiplayer layer replays a host crater (net_terrain.gd `_applying`): the host already
+	# recorded the scaled size, so it is not scaled twice.
+	var replay: bool = net_hook != null and net_hook.get("_applying") == true
+	if not replay:
+		radius *= WarBalance.CRATER_SCALE
+		depth = (depth if depth > 0.0 else minf(radius, CRATER_MAX_R) * 1.2 / WarBalance.CRATER_SCALE) \
+				* WarBalance.CRATER_SCALE * WarBalance.CRATER_DEPTH_SCALE
+	if net_hook != null:
+		var q: Array = net_hook.on_crater(self, center, radius, depth)
+		if q.is_empty():
+			return
+		center = q[0]
+		radius = q[1]
+		depth = q[2]
 	var r := clampf(radius, 1.0, CRATER_MAX_R)
 	var c := center - global_position
-	var lo := Vector3i((c - Vector3.ONE * (r + 1.0)).floor())
-	var hi := Vector3i((c + Vector3.ONE * (r + 1.0)).ceil())
+	# Big craters carve in two passes: the core of the hole (CRATER_CORE_K × r) first and re-meshed
+	# at once (the blast reads immediately), then the rim. Unedited ground is sampled through a
+	# per-crater direction cache of the surface height (_base_cached).
+	var rin := r * CRATER_CORE_K if r >= 6.0 else -1.0
+	var rb := rin if rin > 0.0 else r
+	var lo := Vector3i((c - Vector3.ONE * (rb + 1.0)).floor())
+	var hi := Vector3i((c + Vector3.ONE * (rb + 1.0)).ceil())
 	_craters.append({"c": c, "r": r, "amount": depth if depth > 0.0 else r * 1.2, "z": lo.z, "y": lo.y,
-			"lo": lo, "hi": hi, "soil": 0.0, "world": center})
+			"lo": lo, "hi": hi, "soil": 0.0, "world": center, "rin": rin, "phase": 0 if rin > 0.0 else 1,
+			"sc": {}})
+	crater_started.emit(center, r)
 
 
 ## Carves pending craters row by row (one z, y line of voxels at a time) under the per-frame budget.
@@ -394,8 +458,11 @@ func _step_craters() -> void:
 		var y: int = j["y"]
 		var lo: Vector3i = j["lo"]
 		var hi: Vector3i = j["hi"]
+		var rin: float = j["rin"]
+		var core_pass: bool = int(j["phase"]) == 0
+		# Pass 0: only the core (dist <= rin); pass 1: the rest (dist > rin), or all of a small one.
 		j["soil"] = float(j["soil"]) + _brush_slab(j["c"], j["r"], Brush.DIG, j["amount"], Vector3.ZERO,
-				Vector3.UP, lo, hi, z, z, y, y)
+				Vector3.UP, lo, hi, z, z, y, y, -1.0 if core_pass else rin, rin if core_pass else INF, j["sc"])
 		y += 1
 		if y > hi.y:
 			y = lo.y
@@ -403,15 +470,30 @@ func _step_craters() -> void:
 		j["y"] = y
 		j["z"] = z
 		if z > hi.z:
-			_craters.pop_front()
-			_after_edit(j["c"], j["r"], Brush.DIG, lo, hi)
-			crater_done.emit(j["world"], j["r"], j["soil"])
+			if core_pass:
+				# The core is carved: re-mesh it now, then the rim over the whole box.
+				_after_edit(j["c"], rin, Brush.DIG, lo, hi)
+				var r: float = j["r"]
+				var c: Vector3 = j["c"]
+				var lo2 := Vector3i((c - Vector3.ONE * (r + 1.0)).floor())
+				var hi2 := Vector3i((c + Vector3.ONE * (r + 1.0)).ceil())
+				j["phase"] = 1
+				j["lo"] = lo2
+				j["hi"] = hi2
+				j["z"] = lo2.z
+				j["y"] = lo2.y
+			else:
+				_craters.pop_front()
+				_after_edit(j["c"], j["r"], Brush.DIG, lo, hi)
+				crater_done.emit(j["world"], j["r"], j["soil"])
 
 
 ## The voxel loop of a brush over z0..z1 (and y0..y1, default the whole box) of the box lo..hi
-## (body-local centre c). Returns the soil volume moved (m³, + dug).
+## (body-local centre c). Returns the soil volume moved (m³, + dug). dmin / dmax: only voxels with
+## dmin < distance <= dmax (crater passes); cache: a Dictionary for _base_cached (craters), or null.
 func _brush_slab(c: Vector3, r: float, mode: int, amount: float, plane_point: Vector3, plane_normal: Vector3,
-		lo: Vector3i, hi: Vector3i, z0: int, z1: int, y0 := -2147483647, y1 := 2147483647) -> float:
+		lo: Vector3i, hi: Vector3i, z0: int, z1: int, y0 := -2147483647, y1 := 2147483647, dmin := -1.0,
+		dmax := INF, cache = null) -> float:
 	var soil := 0.0
 	var ya := maxi(lo.y, y0)
 	var yb := mini(hi.y, y1)
@@ -420,7 +502,7 @@ func _brush_slab(c: Vector3, r: float, mode: int, amount: float, plane_point: Ve
 			for x in range(lo.x, hi.x + 1):
 				var p := Vector3(x, y, z) * VOXEL
 				var dist := p.distance_to(c)
-				if dist > r:
+				if dist > r or dist <= dmin or dist > dmax:
 					continue
 				var f := 1.0 - dist / r
 				f = f * f * (3.0 - 2.0 * f)
@@ -435,7 +517,7 @@ func _brush_slab(c: Vector3, r: float, mode: int, amount: float, plane_point: Ve
 				var li := (x & 15) | ((y & 15) << 4) | ((z & 15) << 8)
 				var cur := arr[li]
 				if cur >= TerrainGen.NO_EDIT * 0.5:
-					cur = gen.density_base(p)
+					cur = _base_cached(p, cache) if cache != null else gen.density_base(p)
 				var nv := cur
 				match mode:
 					Brush.DIG:
@@ -453,6 +535,22 @@ func _brush_slab(c: Vector3, r: float, mode: int, amount: float, plane_point: Ve
 				arr[li] = nv
 				edits[key] = arr
 	return soil * VOXEL * VOXEL * VOXEL
+
+
+## Generator density at body-local p with the surface sample (_surf: the noises and the crater
+## loop, the expensive part) cached per direction cell of the crater (1/SURF_Q rad, ~0.6 m at
+## R 60): a big crater evaluates it a few thousand times instead of once per voxel. The detail noise
+## is still per voxel.
+func _base_cached(p: Vector3, cache: Dictionary) -> float:
+	var rr := p.length()
+	if rr < 1.0:
+		return gen.density_base(p)
+	var k := Vector3i((p / rr * SURF_Q).round())
+	var s = cache.get(k)
+	if s == null:
+		s = gen._surf((Vector3(k) / SURF_Q).normalized())
+		cache[k] = s
+	return gen._density(p, rr, s)
 
 
 ## After an edit: remember it for the falling-rock diff, re-mesh what it touched, tell listeners.
@@ -904,13 +1002,15 @@ func _free_chunk(key: Vector4i) -> void:
 func _mark_dirty(lo: Vector3i, hi: Vector3i) -> void:
 	for lod in regen_max_lod + 1:
 		var span := N << lod
-		var reach := (N + 1) << lod
+		# (the chunk's grid plus its skirt margin, _edits_for)
+		var reach := (N + 1 + SKIRT_REACH) << lod
+		var below := SKIRT_REACH << lod
 		var x0 := _floor_to(lo.x - reach, span)
 		var y0 := _floor_to(lo.y - reach, span)
 		var z0 := _floor_to(lo.z - reach, span)
-		for z in range(z0, hi.z + 1, span):
-			for y in range(y0, hi.y + 1, span):
-				for x in range(x0, hi.x + 1, span):
+		for z in range(z0, hi.z + below + 1, span):
+			for y in range(y0, hi.y + below + 1, span):
+				for x in range(x0, hi.x + below + 1, span):
 					if x + reach < lo.x or y + reach < lo.y or z + reach < lo.z:
 						continue
 					var key := Vector4i(x, y, z, lod)
@@ -1030,12 +1130,15 @@ func _sort_queue() -> void:
 	_queue_dirty = false
 
 
+## The edit regions a chunk's mesh reads: its sample grid (origin .. origin + N+1 cells) plus a
+## SKIRT_REACH-cell margin all round, where terrain_gen.gd tests its skirt ends against the ground.
 func _edits_for(origin: Vector3i, lod: int) -> Dictionary:
 	var out := {}
 	if edits.is_empty():
 		return out
-	var hi_g := origin + Vector3i.ONE * ((N + 1) << lod)
-	var lo := Vector3i(origin.x >> 4, origin.y >> 4, origin.z >> 4)
+	var hi_g := origin + Vector3i.ONE * ((N + 1 + SKIRT_REACH) << lod)
+	var lo_g := origin - Vector3i.ONE * (SKIRT_REACH << lod)
+	var lo := Vector3i(lo_g.x >> 4, lo_g.y >> 4, lo_g.z >> 4)
 	var hi := Vector3i(hi_g.x >> 4, hi_g.y >> 4, hi_g.z >> 4)
 	if (hi.x - lo.x + 1) * (hi.y - lo.y + 1) * (hi.z - lo.z + 1) < edits.size():
 		for z in range(lo.z, hi.z + 1):
@@ -1067,7 +1170,7 @@ func _mesh_job(rq: Array, dens: PackedFloat32Array, flags: int, min_abs: float) 
 	var g := TerrainGen.new(seed_value, cfg)
 	if not regions.is_empty():
 		if g.merge_edits(dens, origin, o4.w, regions):
-			r = g.mesh_from_density(dens, origin, o4.w, true)
+			r = g.mesh_from_density(dens, origin, o4.w, true, regions)
 		else:
 			r = {"empty": true}
 	elif flags == 3:
@@ -1268,6 +1371,11 @@ func _drop_removed_flora(c: Chunk, r: Dictionary) -> void:
 			var wxf := global_transform * Transform3D(b, origin + o)
 			var tint := Color(ob[i + 12], ob[i + 13], ob[i + 14], ob[i + 15])
 			var dig: Vector3 = global_transform * (_recent_brush[bi][0] as Vector3)
+			# Torn out by a shock wave: thrown along the blast instead of falling into the pit.
+			var push := _push_at(origin + o) if not _push_zones.is_empty() else Vector3.ZERO
+			if push != Vector3.ZERO and _debris.has_method("launch_flora"):
+				_debris.launch_flora(k, flora_meshes[k], wxf, tint, push)
+				continue
 			if k in FloraDebris.SMALL_KINDS:
 				if small_xf.size() < 40:
 					small_xf.append(wxf)
@@ -1530,6 +1638,18 @@ func load_state(d: Dictionary) -> void:
 	for k: Vector3i in touched:
 		_mark_dirty(k * 16 - Vector3i.ONE, k * 16 + Vector3i.ONE * 16)
 	_last_edit_usec = Time.get_ticks_usec()
+
+
+## Multiplayer drift repair (scripts/net/net_terrain.gd): replaces one 16³ edit region with the
+## host's copy (null = no edits there) and re-meshes around it.
+func net_set_region(k: Vector3i, arr) -> void:
+	if arr is PackedFloat32Array and (arr as PackedFloat32Array).size() == 4096:
+		edits[k] = arr
+	else:
+		edits.erase(k)
+	_mark_dirty(k * 16 - Vector3i.ONE, k * 16 + Vector3i.ONE * 17)
+	_last_edit_usec = Time.get_ticks_usec()
+	brush_applied.emit(global_position + Vector3(k * 16) + Vector3.ONE * 8.0, 14.0)
 
 
 ## True once the ground under a world position has full-detail collision: every point of a few

@@ -12,27 +12,26 @@ config_version=5
 
 config/name="Uzay Sınırı"
 config/description="İki küçük gezegen: kaz, malzeme topla, rakibe karşı savaş"
-run/main_scene="res://scenes/main.tscn"
+run/main_scene="res://scenes/menu.tscn"
 config/features=PackedStringArray("4.7", "Forward Plus")
 config/icon="res://icon.svg"
 
 [autoload]
 
 Game="*res://scripts/game.gd"
+Net="*res://scripts/net/net.gd"
 
 [display]
 
 window/size/viewport_width=1600
 window/size/viewport_height=900
 window/size/mode=3
-window/vsync/vsync_mode=1
 
 [physics]
 
 3d/default_gravity=0.0
 3d/default_linear_damp=0.0
 3d/default_angular_damp=0.0
-common/physics_ticks_per_second=60
 
 [rendering]
 

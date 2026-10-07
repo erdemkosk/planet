@@ -188,6 +188,8 @@ var _dust: GPUParticles3D
 var _dust_pm: ParticleProcessMaterial
 var _sparks: GPUParticles3D
 var _sparks_pm: ParticleProcessMaterial
+var _kick: GPUParticles3D       # chunks thrown back toward the player (kick_back(); the player's drill only)
+var _kick_pm: ParticleProcessMaterial
 var _hot_light: OmniLight3D
 var _hot_glow: MeshInstance3D
 var _hot_mat: StandardMaterial3D
@@ -340,6 +342,25 @@ func _build_particles() -> void:
 	_spray_pm.angular_velocity_max = 720.0
 	_spray_pm.particle_flag_rotate_y = true
 	_spray.process_material = _spray_pm
+
+	# Kick-back: bigger clods flung back toward the camera in an arc that lands short of it.
+	var clod := BoxMesh.new()
+	clod.size = Vector3(0.07, 0.055, 0.06)
+	clod.material = chunk_mat
+	_kick = _particles(16, 0.75, clod)
+	_kick_pm = ParticleProcessMaterial.new()
+	_kick_pm.emission_shape = ParticleProcessMaterial.EMISSION_SHAPE_SPHERE
+	_kick_pm.emission_sphere_radius = 0.25
+	_kick_pm.direction = Vector3(0, 1, 0)
+	_kick_pm.spread = 16.0
+	_kick_pm.scale_min = 0.5
+	_kick_pm.scale_max = 1.25
+	_kick_pm.scale_curve = _curve([Vector2(0, 1.0), Vector2(0.8, 0.9), Vector2(1, 0.0)])
+	_kick_pm.color_initial_ramp = var_tex
+	_kick_pm.angular_velocity_min = -720.0
+	_kick_pm.angular_velocity_max = 720.0
+	_kick_pm.particle_flag_rotate_y = true
+	_kick.process_material = _kick_pm
 
 	# Dust puffs (soft billboards).
 	var dust_mat := StandardMaterial3D.new()
@@ -518,6 +539,28 @@ func set_working(on: bool) -> void:
 		_spray.emitting = false
 		_dust.emitting = false
 		_sparks.emitting = false
+		_kick.emitting = false
+
+
+## Chunks thrown back toward `eye` (the camera, world) from the hit point, arcing under gravity (-up)
+## to land roughly halfway: never into the view. strength 0..1 (power; SÜPER KAZI / the bore > 1
+## throws more). Call it each physics frame after work(); it stops with the work.
+func kick_back(hit: Vector3, eye: Vector3, up: Vector3, soil := SOIL, strength := 1.0) -> void:
+	var to_eye := eye - hit
+	var dist := to_eye.length()
+	if dist < 1.2 or strength <= 0.01:
+		_kick.emitting = false
+		return
+	var flat := to_eye - up * to_eye.dot(up)
+	var dir := (flat.normalized() * 0.75 + up * 0.66).normalized() if flat.length_squared() > 1e-4 else up
+	_kick.global_transform = Transform3D(_basis_y(dir), hit + up * 0.1)
+	var v := clampf(dist * 0.95, 2.0, 6.5)
+	_kick_pm.initial_velocity_min = v * 0.75
+	_kick_pm.initial_velocity_max = v
+	_kick_pm.gravity = -up * 9.0
+	_kick_pm.color = soil.darkened(0.05)
+	_kick.amount_ratio = clampf(0.35 * strength, 0.1, 1.0)
+	_kick.emitting = true
 
 
 ## Called every physics frame while the tool is working.

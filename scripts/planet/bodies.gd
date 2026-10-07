@@ -16,19 +16,24 @@ extends RefCounted
 ## shape the surface (continents, hills, ridged ranges, craters...). Colours (sRGB) drive
 ## shaders/moon_terrain.gdshader. max_depth >= radius puts the whole ball in the LOD band, so the
 ## planet can be dug to (and through) the core. detail_lod / detail_dist / regen_max_lod: see planet.gd.
+## Matches (single and multiplayer) override the presets' colours, relief, rocks and seed with a
+## random world (scripts/planet/random_world.gd, main.gd; cfg "world_name" = its name); the presets
+## below are the fallback and keep the team core colours. The Eğitim Alanı uses its own overrides.
 
 ## THE size and layout numbers (everything else derives from these two): both planets' radius and
 ## the centre-to-centre distance. main.gd places them at ∓PLANET_DISTANCE / 2 on the x axis. The
 ## surface gravity stays BASE "gravity" (0.8 g) whatever the radius; the cannon speeds, the crater
 ## size, the flak and the bots' ranges in scripts/war/balance.gd are tuned for these values
 ## (re-check them on a change). The terrain relief below scales with the radius (a scale model).
+## 2026-10-06 the user: 30 -> 60 m ("we never fight on open ground, we can't see the enemy": the
+## horizon was ~10 m away); the centre distance stays, so the surface gap is ~230 m (was ~290 m).
 const PLANET_RADIUS := 60.0
 const PLANET_DISTANCE := 350.0
 
 ## Shared by both planets; PRESETS entries override it.
 const BASE := {
 	# max_depth just past the centre: the whole ball is in the LOD band, so it can be dug to the core.
-	# max_height: the band above the base radius (relief ~±9 m at R 60, plus raised ground).
+	# max_height: the band above the base radius (relief ~±9 m at R 60 (60 voxels of radius), plus raised ground).
 	"kind": 1, "radius": PLANET_RADIUS, "max_height": PLANET_RADIUS * 0.3, "max_depth": PLANET_RADIUS + 2.0,
 	"cave_min_r": 1.0e6, "cave_entrance": 0.0,          # no caves
 	# detail_dist: the far-detail rule covers the far side of the other planet from anywhere here.
@@ -58,7 +63,7 @@ const PRESETS := {
 		"strata": [Color(0.46, 0.37, 0.27), Color(0.37, 0.31, 0.25), Color(0.27, 0.25, 0.25)],
 		"rock_tint": Color(0.42, 0.42, 0.40),
 		"soil_color": Color(0.42, 0.33, 0.22),
-		"core_color": Color(0.45, 0.78, 0.86),   # deep rock tint toward the core (cyan, scripts/war/core.gd)
+		"core_color": Color(0.36, 0.18, 0.74),   # deep rock tint toward the core (violet, scripts/war/core.gd)
 		"step": "step_dirt",
 	},
 	# The AI rival's planet: rusty red.
@@ -70,7 +75,7 @@ const PRESETS := {
 		"strata": [Color(0.72, 0.39, 0.21), Color(0.57, 0.27, 0.15), Color(0.35, 0.19, 0.15)],
 		"rock_tint": Color(0.55, 0.28, 0.17),
 		"soil_color": Color(0.58, 0.30, 0.17),
-		"core_color": Color(0.92, 0.32, 0.16),   # deep rock tint toward the core (red)
+		"core_color": Color(0.66, 0.07, 0.15),   # deep rock tint toward the core (crimson)
 		"step": "step_rock",
 	},
 }

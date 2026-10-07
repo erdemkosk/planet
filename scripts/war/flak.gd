@@ -11,7 +11,8 @@ extends Node3D
 ## hide it), opens fire after a 1-2 s reaction, leads it with Ballistics.intercept (the skiff's
 ## velocity and its smoothed acceleration) and fires fast. Its aim error shrinks while the target
 ## flies steadily and resets when it jinks, so evasive flying makes it miss. `tracking` is true
-## while it engages (HUD: "RAKİP SENİ GÖRDÜ" for the rival's).
+## while it engages (HUD: "RAKİP SENİ GÖRDÜ" for the rival's). Enemy drop pods in flight
+## (scripts/war/drop_pod.gd, group "war_drop_pod") are engaged the same way (nearest target first).
 ##
 ## Player (team "home"): F mans it (seat API), first person behind the guns. Mouse = aim, LMB held
 ## = fire (FLAK_ROUND_COST material per round), F = leave. While manned nothing is automatic: the
@@ -30,12 +31,22 @@ const DigFx := preload("res://scripts/items/dig_fx.gd")
 const Snd := preload("res://scripts/audio/snd_lib.gd")
 const Settings := preload("res://scripts/save/settings.gd")
 const UI := preload("res://scripts/ui/ui_style.gd")
+const Foundation := preload("res://scripts/war/foundation.gd")
 
-const PIVOT_Y := 1.6                  # cradle pivot height above the plinth base
+const PIVOT_Y := 1.6                 # cradle pivot height above the plinth base
 const BARREL_LEN := 2.9
 const BARREL_X := 0.24                # half spacing of the twin barrels
 const MOUSE_SENS := 0.0018
 const FIRE_CONE := deg_to_rad(2.0)    # barrels within this of the solution: fire
+# Gunner's eye (cradle-local, on the line through the ring sight parallel to the barrels; _eye_pos).
+# It used to sit fixed 0.75 m behind the trunnions, so above ~30° elevation it swung down into the
+# turret housing (the user: "uçaksavara binince yerine değil altına giriyor").
+const SIGHT_Z := -0.45                # the ring sight (its centre 0.42 above the bore axis)
+const EYE_UP := 0.44                  # the eye just over the ring's centre
+const EYE_BACK := 1.2                 # ...this far behind the ring when nothing is in the way
+const EYE_MIN_UP := 0.12              # never lower than this over the trunnion pivot (turret roof: pivot - 0.05)
+const EYE_MAX_BACK := 0.68            # never further back than this behind it (radar mast: pivot + 0.9)
+const VIS_GUNNER_HIDE := 1 << 15      # visual layer the gunner's camera skips: the radar over his head
 
 signal destroyed(flak: Node3D)
 
@@ -74,6 +85,7 @@ var _paint: StandardMaterial3D
 var _build_t := -1.0
 var _parts: Array = []
 var _ground_check := false
+var _foundation: Node3D               # jack extensions down to the real ground (scripts/war/foundation.gd)
 var _rng := RandomNumberGenerator.new()
 var _t := 0.0
 # Fire control (rival).
@@ -131,6 +143,9 @@ func _ready() -> void:
 	_rng.randomize()
 	_react = _rng.randf_range(Balance.FLAK_REACT_MIN, Balance.FLAK_REACT_MAX)
 	_build_model()
+	if body != null and not has_meta("build_preview"):
+		_foundation = Foundation.create(self, body, PackedVector3Array(), _foundation_piles(), Color.GRAY)
+		_parts.append([_foundation, _foundation.transform, 0.0])
 	_build_audio()
 	_font = UI.font(500)
 	_font_b = UI.font(700)
@@ -235,7 +250,7 @@ func _build_model() -> void:
 		# Feed chutes up to the guns.
 		_box(_turret, Vector3(0.78 * sx, 0.95, 0.05), Vector3(0.16, 0.5, 0.18), steel, Vector3(0.3, 0, 0.35 * sx))
 	# Radar mast at the back with a spinning dish.
-	_cyl(_turret, Vector3(0, 1.25, 0.85), 0.05, 0.07, 1.2, steel)
+	var mast := _cyl(_turret, Vector3(0, 1.25, 0.85), 0.05, 0.07, 1.2, steel)
 	_dish = Node3D.new()
 	_dish.position = Vector3(0, 1.9, 0.85)
 	_turret.add_child(_dish)
@@ -253,6 +268,11 @@ func _build_model() -> void:
 	_dish.add_child(dish_mi)
 	_cyl(_dish, Vector3(0, 0, -0.32), 0.03, 0.03, 0.42, steel, "z", 8)
 	_box(_dish, Vector3(0, 0, -0.08), Vector3(0.14, 0.14, 0.14), dark)
+	# The gunner's camera skips the radar (it stands right over his head: aiming high, the spinning
+	# dish swept across the sight); everyone else sees it, and its shadow stays.
+	mast.layers = VIS_GUNNER_HIDE
+	for mi in _dish.find_children("*", "MeshInstance3D", true, false):
+		(mi as MeshInstance3D).layers = VIS_GUNNER_HIDE
 	_parts.append([_turret, _turret.transform, 0.25])
 
 	# --- Cradle (pitch): receivers and the twin barrels with cooling jackets and flash hiders.
@@ -321,13 +341,14 @@ func _build_model() -> void:
 	_cradle.add_child(_flash)
 	_flash.position = Vector3(0, 0.1, -0.55 - BARREL_LEN - 0.4)
 
-	# Gunner's eye behind the ring sight (pitches with the guns).
+	# Gunner's eye behind the ring sight (pitches with the guns; _eye_pos keeps it out of the turret).
 	_cam = Camera3D.new()
 	_cam.near = 0.05
 	_cam.far = Game.CAM_FAR
 	_cam.fov = Settings.fov
+	_cam.cull_mask = 0xFFFFF & ~VIS_GUNNER_HIDE
 	_cradle.add_child(_cam)
-	_cam.position = Vector3(0, 0.44, 0.75)
+	_cam.position = _eye_pos(pitch)
 
 
 func _build_audio() -> void:
@@ -345,13 +366,14 @@ func _build_audio() -> void:
 
 
 func begin_assembly() -> void:
+	# The print (build_fx.gd) measures the whole model first, then the parts drop in through it.
+	BuildFx.assemble(get_parent(), global_transform, Vector3(1.9, 1.4, 1.9), BuildFx.AUTO, self)
 	_build_t = 0.0
 	for p in _parts:
 		var n: Node3D = p[0]
 		n.transform = (p[1] as Transform3D).translated_local(Vector3(0, 2.0, 0))
 		n.scale = Vector3.ONE * 0.6
 		n.visible = false
-	BuildFx.assemble(get_parent(), global_transform, Vector3(1.9, 1.4, 1.9))
 
 
 # =================================================================================================
@@ -405,6 +427,22 @@ func fire_round(fuse_time := 0.0) -> bool:
 	_gun_audio.play()
 	_puff(from, dir)
 	return true
+
+
+## Multiplayer: the other peer fired a round from this gun; recoil, flash, sound, smoke (the round
+## comes as its own event, scripts/net/net_world.gd).
+func net_fire_fx() -> void:
+	_cool = Balance.FLAK_INTERVAL
+	var i := _next_barrel
+	_next_barrel = 1 - _next_barrel
+	var dir := barrel_dir()
+	var from: Vector3 = (_muzzles[i] as Node3D).global_position + dir * 0.2
+	_kick[i] = 0.28
+	_flash.position = Vector3(BARREL_X * (-1.0 if i == 0 else 1.0), 0.1, -0.55 - BARREL_LEN - 0.4)
+	_flash_t = 1.0
+	_gun_audio.pitch_scale = _rng.randf_range(0.58, 0.68)
+	_gun_audio.play()
+	_puff(from, dir)
 
 
 ## A small muzzle smoke puff.
@@ -500,6 +538,8 @@ func _process(delta: float) -> void:
 func _physics_process(delta: float) -> void:
 	if is_destroyed or _build_t >= 0.0:
 		return
+	if pilot == null and (Net.is_client() or has_meta("net_busy")):
+		return            # multiplayer: the host's copy runs the fire control / the other player mans it
 	if pilot != null:
 		if tracking or _target != null:
 			_target = null
@@ -571,10 +611,11 @@ func _sense() -> void:
 	var best: Node3D = null
 	var best_d := INF
 	var eye := global_position + global_transform.basis.y * 2.4
-	for s in get_tree().get_nodes_in_group("skiff"):
+	# (also enemy drop pods in flight: scripts/war/drop_pod.gd, group "war_drop_pod", is_live())
+	for s in get_tree().get_nodes_in_group("skiff") + get_tree().get_nodes_in_group("war_drop_pod"):
 		if not (s is Node3D) or not is_instance_valid(s) or not (s as Node3D).is_inside_tree():
 			continue
-		if Game.team_of(s) == team:
+		if Game.team_of(s) == team or (s.has_method("is_live") and not s.is_live()):
 			continue
 		var d := eye.distance_to(_hull(s))
 		if d < best_d:
@@ -599,6 +640,8 @@ func _sense() -> void:
 
 
 static func _hull(n: Node3D) -> Vector3:
+	if n.is_in_group("war_drop_pod"):
+		return n.global_position             # (a drop pod's origin is its centre)
 	return n.global_position + n.global_transform.basis.y * 0.9
 
 
@@ -648,11 +691,13 @@ func get_interact_prompt() -> String:
 		return ""
 	if _build_t >= 0.0:
 		return "Uçaksavar kuruluyor…"
+	if has_meta("net_busy"):
+		return "Uçaksavar dolu — arkadaşın kullanıyor"
 	return "Uçaksavara geç"
 
 
 func interact(p) -> void:
-	if team != "home" or _build_t >= 0.0 or is_destroyed:
+	if team != "home" or _build_t >= 0.0 or is_destroyed or has_meta("net_busy"):
 		return
 	p.enter_vehicle(self)
 
@@ -717,13 +762,29 @@ func _unhandled_input(event: InputEvent) -> void:
 
 func _update_manned(delta: float) -> void:
 	_cam_kick = move_toward(_cam_kick, 0.0, delta * 6.0)
-	_cam.position = Vector3(_rng.randf_range(-1.0, 1.0) * 0.01 * _cam_kick, 0.44, 0.75 + _cam_kick * 0.06)
+	# (the recoil shoves the eye back up to 6 cm: inside the margins _eye_pos keeps)
+	_cam.position = _eye_pos(pitch) + Vector3(_rng.randf_range(-1.0, 1.0) * 0.01 * _cam_kick, 0.0, _cam_kick * 0.06)
 	_update_lead()
 	if _firing and ready_to_fire():
 		var fuse: float = float(_lead.get("time", 0.0)) + 0.2 if not _lead.is_empty() else 0.0
 		fire_round(fuse)
 	if _ov != null:
 		_ov.queue_redraw()
+
+
+## The gunner's eye at elevation `p` (cradle-local): EYE_BACK behind the ring sight, drawn in along
+## the sight line as the guns rise so that, seen from the turret, it stays EYE_MIN_UP above the
+## trunnions (clear of the housing, which the old fixed eye sank into above ~30°) and no more than
+## EYE_MAX_BACK behind them (clear of the radar mast). At 88° it is ~0.35 m behind the ring.
+static func _eye_pos(p: float) -> Vector3:
+	var z := SIGHT_Z + EYE_BACK
+	var s := sin(p)
+	var c := cos(p)
+	if s > 0.001:
+		z = minf(z, (EYE_UP * c - EYE_MIN_UP) / s)     # turret-frame height EYE_UP*c - z*s >= EYE_MIN_UP
+	if c > 0.001:
+		z = minf(z, (EYE_MAX_BACK - EYE_UP * s) / c)   # turret-frame back  EYE_UP*s + z*c <= EYE_MAX_BACK
+	return Vector3(0.0, EYE_UP, z)
 
 
 ## The lead marker: the incoming enemy shell or enemy skiff nearest to the sight line, solved like
@@ -775,6 +836,7 @@ static func _lead_point(n: Node3D) -> Vector3:
 
 func _make_overlay() -> void:
 	_overlay = CanvasLayer.new()
+	_overlay.add_to_group("gameplay_overlay")     # hidden on the end screen / menus (overlay_guard.gd)
 	_overlay.layer = 7
 	add_child(_overlay)
 	_ov = Control.new()
@@ -883,19 +945,34 @@ func _on_brush(center: Vector3, r: float) -> void:
 		_settle.call_deferred()
 
 
+## Sinks only when its jacks and plinth lost the ground (Foundation.support_drop, never up), then the
+## jack extensions refit to the new ground.
 func _settle() -> void:
 	await get_tree().create_timer(1.2).timeout
 	_ground_check = false
 	if is_destroyed or body == null or not is_inside_tree():
 		return
 	var up: Vector3 = global_transform.basis.y.normalized()
-	var hit: Dictionary = body.raycast_density(global_position + up * 2.0, global_position - up * 40.0, 0.5)
-	if hit.is_empty():
-		return
-	var drop: float = global_position.distance_to(hit["position"])
+	var pts := PackedVector3Array([Vector3.ZERO])
+	for pl in _foundation_piles():
+		pts.append(pl[0])
+	var drop := Foundation.support_drop(self, body, pts)
 	if drop > 0.4:
 		var land := func() -> void:
 			BuildFx.dust(get_parent(), global_position, up, 2.5, Color(0.5, 0.45, 0.38))
+			if _foundation != null and is_instance_valid(_foundation):
+				_foundation.refit(true)
 		var tw := create_tween()
-		tw.tween_property(self, "global_position", hit["position"], clampf(sqrt(drop) * 0.3, 0.2, 1.2)).set_ease(Tween.EASE_IN).set_trans(Tween.TRANS_QUAD)
+		tw.tween_property(self, "global_position", global_position - up * drop, clampf(sqrt(drop) * 0.3, 0.2, 1.2)).set_ease(Tween.EASE_IN).set_trans(Tween.TRANS_QUAD)
 		tw.tween_callback(land)
+	elif _foundation != null and is_instance_valid(_foundation):
+		_foundation.refit(true)
+
+
+## Foundation (scripts/war/foundation.gd): a pile under each hydraulic jack's foot (local).
+func _foundation_piles() -> Array:
+	var piles: Array = []
+	for i in 4:
+		var a := TAU * float(i) / 4.0 + PI * 0.25
+		piles.append([Vector3(-2.0 * sin(a), 0.0, -2.0 * cos(a)), 0.14])
+	return piles

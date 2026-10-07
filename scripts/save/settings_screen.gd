@@ -25,11 +25,12 @@ func _ready() -> void:
 	_panel.custom_minimum_size = Vector2(640, 0)
 	_panel.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	_panel.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_panel.draw.connect(func() -> void: _panel.draw_rect(Rect2(Vector2(30, 0), Vector2(150, 3)), UI.SUIT_ORANGE))
 	var v := UI.vbox(_panel, 12)
 	var head := UI.hbox(v, 12)
 	var hv := UI.vbox(head, 2)
 	hv.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	Kit.heading(hv, "OYUN", 12, UI.CYAN, 3)
+	Kit.heading(hv, "OYUN", 12, UI.SUIT_ORANGE.lightened(0.15), 3)
 	UI.label(hv, "Ayarlar", 30, UI.TEXT, 700)
 	_back = Kit.menu_button(head, "Geri", "Esc", "", 150)
 	_back.size_flags_vertical = Control.SIZE_SHRINK_CENTER
@@ -41,8 +42,14 @@ func _ready() -> void:
 	_check("Y eksenini ters çevir", Settings.invert_y, _set_invert)
 	UI.section_title(_rows, "GÖRÜNTÜ")
 	_slider("Görüş alanı (FOV)", 60.0, 100.0, 1.0, Settings.fov, _set_fov, _fmt_deg)
+	_slider("Hareket bulanıklığı", 0.0, 2.0, 1.0, float(Settings.motion_blur), _set_motion_blur, _fmt_blur)
+	_slider("Kask efektleri", 0.0, 2.0, 1.0, float(Settings.helmet_fx), _set_helmet_fx, _fmt_helmet)
+	_slider("Arka plan savaşı", 0.0, 2.0, 1.0, float(Settings.space_battle), _set_space_battle, _fmt_space_battle)
 	_full = _check("Tam ekran  (F11)", DisplayServer.window_get_mode() == DisplayServer.WINDOW_MODE_FULLSCREEN, _set_full)
 	_check("Dikey senkron (V-Sync)", Settings.vsync, _set_vsync)
+	_slider("HUD", 0.0, 2.0, 1.0, float(Settings.hud_mode), _set_hud_mode, _fmt_hud)
+	UI.label(_rows, "Sade: nişangâh, can, cephane; gerisi gerektiğinde. Alt basılı: hepsi.", 12, UI.FAINT)
+	_check("Hasar sayıları", Settings.damage_numbers, _set_damage_numbers)
 	UI.section_title(_rows, "SES")
 	_slider("Ana ses", 0.0, 1.0, 0.01, Settings.master_volume, _set_volume, _fmt_pct)
 	UI.rule(v)
@@ -69,6 +76,47 @@ func _set_fov(x: float) -> void:
 
 func _set_full(on: bool) -> void:
 	Settings.set_fullscreen(on)
+
+
+func _set_damage_numbers(on: bool) -> void:
+	Settings.damage_numbers = on
+
+
+## HUD density: Sade / Normal / Detaylı (scripts/ui/hud_mode.gd; the widgets follow at once).
+func _set_hud_mode(x: float) -> void:
+	Settings.set_hud_mode(roundi(x))
+
+
+func _fmt_hud(x: float) -> String:
+	return ["Sade", "Normal", "Detaylı"][clampi(roundi(x), 0, 2)]
+
+
+## Camera motion blur level (scripts/ui/motion_blur.gd reads it every frame).
+func _set_motion_blur(x: float) -> void:
+	Settings.motion_blur = clampi(roundi(x), 0, 2)
+
+
+func _fmt_blur(x: float) -> String:
+	return ["Kapalı", "Düşük", "Orta"][clampi(roundi(x), 0, 2)]
+
+
+## Inside-the-helmet effects (scripts/ui/helmet_fx.gd reads it every frame): visor, helmet
+## acoustics, suit sounds, breath camera.
+func _set_helmet_fx(x: float) -> void:
+	Settings.helmet_fx = clampi(roundi(x), 0, 2)
+
+
+func _fmt_helmet(x: float) -> String:
+	return ["Kapalı", "Düşük", "Orta"][clampi(roundi(x), 0, 2)]
+
+
+## Cosmetic far-off space battle (scripts/fx/space_battle.gd rebuilds itself when this changes).
+func _set_space_battle(x: float) -> void:
+	Settings.space_battle = clampi(roundi(x), 0, 2)
+
+
+func _fmt_space_battle(x: float) -> String:
+	return ["Kapalı", "Düşük", "Yüksek"][clampi(roundi(x), 0, 2)]
 
 
 func _set_vsync(on: bool) -> void:
@@ -135,7 +183,8 @@ func _slider(title: String, lo: float, hi: float, step: float, value: float, on_
 	s.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	s.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	row.add_child(s)
-	var vl := UI.label(row, fmt.call(value), 14, UI.CYAN, 700)
+	var vl := UI.label(row, fmt.call(value), 15, UI.SUIT_ORANGE.lightened(0.2), 700)
+	vl.add_theme_font_override("font", UI.font_num(700))
 	vl.custom_minimum_size.x = 64
 	vl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	s.value_changed.connect(_on_slider.bind(on_change, fmt, vl))

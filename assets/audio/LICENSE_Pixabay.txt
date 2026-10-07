@@ -1,0 +1,20 @@
+Pixabay Content License, https://pixabay.com/service/license-summary/
+
+  - Free to use in commercial and non-commercial projects, including games.
+  - Modification allowed; no attribution required (credit appreciated).
+  - Not allowed: selling or distributing the content as-is (unaltered) as a stand-alone file,
+    or presenting it as your own sound library.
+
+Source used:
+  "Male Breathing" by freesound_community (Pixabay, sound 84775),
+  file freesound_community-male-breathing-84775.mp3 (8.4 s, mono, 44.1 kHz).
+
+Derived files (all processed, nothing distributed unaltered):
+  assets/audio/helmet/breath_in_*_NN.wav, breath_out_*_NN.wav, breath_hold_NN.wav,
+  breath_release_NN.wav: cleaned (high-pass 150 Hz against the handling rumble, light FFT denoise,
+  gentle expander), cut into single inhales / exhales, time-stretched / pitch-shifted into calm /
+  exert / panic variants, EQ'd with an in-helmet colouring and a short visor reflection, faded and
+  loudness-normalised (scripts/ui/helmet_fx.gd plays them).
+
+The other assets/audio/helmet files (suit_fan.wav, suit_servo_NN.wav) come from the Sonniss GDC
+bundles: see LICENSE_Sonniss.txt.
