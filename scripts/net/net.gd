@@ -189,14 +189,17 @@ static func fingerprint() -> int:
 	var parts: Array = [PROTOCOL, Bodies.PLANET_RADIUS, Bodies.PLANET_DISTANCE]
 	for p in ["home", "rival"]:
 		parts.append(int((Bodies.PRESETS[p] as Dictionary).get("seed", 0)))
+	# The map's keys are StringNames, and sorting StringNames orders them by their interned pointer
+	# (differs every run / machine), so the same build hashed differently on each side: sort
+	# plain "key=value" Strings instead (alphabetical, identical everywhere).
 	var bal: Dictionary = (Balance as Script).get_script_constant_map()
-	var keys: Array = bal.keys()
-	keys.sort()
-	for k in keys:
+	var entries := PackedStringArray()
+	for k in bal:
 		if bal[k] is Object:
 			continue                       # (a preloaded resource prints its instance id)
-		parts.append(str(k))
-		parts.append(str(bal[k]))
+		entries.append("%s=%s" % [str(k), str(bal[k])])
+	entries.sort()
+	parts.append_array(Array(entries))
 	return hash(str(parts))
 
 
